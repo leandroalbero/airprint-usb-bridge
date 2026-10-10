@@ -1,0 +1,142 @@
+{
+  "model": "QL-700",
+  "usb_vendor": 1273,
+  "usb_product": 8258,
+  "usb_product_editor_lite": 8265,
+  "status_model_byte3": 52,
+  "status_model_byte4": 53,
+  "pins": 720,
+  "bytes_per_line": 90,
+  "dpi": 300,
+  "supports_esc_i_a": false,
+  "supports_compression": false,
+  "continuous_margin_dots": {
+    "value": [
+      35,
+      1500
+    ],
+    "source": "documented",
+    "note": "ref 3.2.3; 0 accepted by firmware, see leading/trailing blank"
+  },
+  "continuous_page_length_dots": {
+    "value": [
+      150,
+      11811
+    ],
+    "source": "documented",
+    "note": "ref 3.2.4; 56-dot pages print without error (2026-10-02)"
+  },
+  "leading_blank_dots": {
+    "value": 33,
+    "source": "measured",
+    "note": "~2.8 mm, photo of 56/200-dot calibration bands, margin 0, 2026-10-02"
+  },
+  "trailing_blank_dots": {
+    "value": 37,
+    "source": "measured",
+    "note": "~3.1 mm, same photo"
+  },
+  "valid_error_bits": {
+    "err1": [
+      1,
+      2,
+      4
+    ],
+    "err2": [
+      1,
+      4,
+      16,
+      64,
+      128
+    ]
+  },
+  "media": [
+    {
+      "id": "62",
+      "name": "62 mm continuous (DK-22205)",
+      "ref_id": 259,
+      "kind": 10,
+      "width_mm": 62,
+      "length_mm": 0,
+      "left_margin_pins": 12,
+      "print_pins": 696,
+      "right_margin_pins": 12,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "29",
+      "name": "29 mm continuous (DK-22210)",
+      "ref_id": 258,
+      "kind": 10,
+      "width_mm": 29,
+      "length_mm": 0,
+      "left_margin_pins": 408,
+      "print_pins": 306,
+      "right_margin_pins": 6,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "12",
+      "name": "12 mm continuous (DK-22214)",
+      "ref_id": 257,
+      "kind": 10,
+      "width_mm": 12,
+      "length_mm": 0,
+      "left_margin_pins": 585,
+      "print_pins": 106,
+      "right_margin_pins": 29,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "23x23",
+      "name": "23x23 mm die-cut (DK-11221)",
+      "ref_id": 370,
+      "kind": 11,
+      "width_mm": 23,
+      "length_mm": 23,
+      "left_margin_pins": 442,
+      "print_pins": 236,
+      "right_margin_pins": 42,
+      "print_length_dots": 202,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "d12",
+      "name": "12 mm round die-cut (DK-11219)",
+      "ref_id": 362,
+      "kind": 11,
+      "width_mm": 12,
+      "length_mm": 12,
+      "left_margin_pins": 513,
+      "print_pins": 94,
+      "right_margin_pins": 113,
+      "print_length_dots": 94,
+      "fixed_margin_dots": 35,
+      "x_trim_dots": 0
+    }
+  ],
+  "settings": [
+    {
+      "id": "auto-power-off",
+      "key": 65,
+      "values": [
+        {"id": "never", "value": 0},
+        {"id": "10m", "value": 1},
+        {"id": "20m", "value": 2},
+        {"id": "30m", "value": 3},
+        {"id": "40m", "value": 4},
+        {"id": "50m", "value": 5},
+        {"id": "60m", "value": 6}
+      ]
+    },
+    {
+      "id": "auto-power-on",
+      "key": 112,
+      "values": [
+        {"id": "off", "value": 0},
+        {"id": "on", "value": 1}
+      ]
+    }
+  ],
+  "mirror": true
+}

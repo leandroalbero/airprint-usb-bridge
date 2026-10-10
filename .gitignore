@@ -1,0 +1,5 @@
+docs/specs/
+testdata/private/
+/ql-airprint
+/dist/
+*.prn
