@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/OpenPrinting/goipp"
+
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver/brotherql"
 )
 
 func names(attrs goipp.Attributes) []string {
@@ -275,7 +277,7 @@ func TestValidateJobMedia(t *testing.T) {
 
 func TestValidateJobHighRes(t *testing.T) {
 	cfg := testConfig()
-	cfg.HighRes = true
+	cfg.Caps = qlCaps(func(o *brotherql.Options) { o.HighRes = true })
 	ts := startServer(t, cfg, (&recorder{}).process)
 	yes := true
 	ok := []goipp.Attribute{
@@ -839,7 +841,7 @@ func TestTXT(t *testing.T) {
 	cfg := testConfig()
 	txt := cfg.TXT("printer.local", 8631)
 	want := map[string]string{
-		"rp": "ipp/print", "ty": cfg.MakeModel, "adminurl": "https://printer.local:8631/", "note": cfg.Location,
+		"rp": "ipp/print", "ty": cfg.Caps.MakeModel, "adminurl": "https://printer.local:8631/", "note": cfg.Location,
 		"pdl": "image/pwg-raster,image/urf", "Color": "F", "Duplex": "F", "UUID": "00000000-1111-2222-3333-444455556666",
 		"TLS": "1.2", "URF": "V1.4,W8,CP1,RS300", "txtvers": "1", "qtotal": "1",
 	}
@@ -855,11 +857,11 @@ func TestTXT(t *testing.T) {
 
 func TestConfigValidation(t *testing.T) {
 	for name, mut := range map[string]func(*Config){
-		"no name":    func(c *Config) { c.Name = "" },
-		"no uuid":    func(c *Config) { c.UUID = "" },
-		"no width":   func(c *Config) { c.RollWidth = 0 },
-		"bad policy": func(c *Config) { c.MediaPolicy = "sheets" },
-		"bad range":  func(c *Config) { c.RollMinLength, c.RollMaxLength = 500, 400 },
+		"no name":   func(c *Config) { c.Name = "" },
+		"no uuid":   func(c *Config) { c.UUID = "" },
+		"no width":  func(c *Config) { c.Caps.Roll.Width = 0 },
+		"no media":  func(c *Config) { c.Caps.Roll, c.Caps.Media = nil, nil },
+		"bad range": func(c *Config) { c.Caps.Roll.MinLength, c.Caps.Roll.MaxLength = 500, 400 },
 	} {
 		c := testConfig()
 		mut(&c)
@@ -874,7 +876,7 @@ func TestConfigValidation(t *testing.T) {
 
 func TestMediaPolicyPresets(t *testing.T) {
 	cfg := testConfig()
-	cfg.MediaPolicy = MediaRollPresets
+	cfg.Caps = qlCaps(func(o *brotherql.Options) { o.MediaPolicy = brotherql.PolicyRollPresets })
 	ts := startServer(t, cfg, (&recorder{}).process)
 	pa := ts.do(t, "ipp", opRequest(goipp.OpGetPrinterAttributes, ts.uri("ipp"), requestedAttrs("media-ready", "media-col-ready")), nil)
 	ready, _ := attrOf(pa.Printer, "media-ready")

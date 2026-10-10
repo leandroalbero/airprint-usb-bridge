@@ -13,16 +13,39 @@ import (
 	"time"
 
 	"github.com/OpenPrinting/goipp"
+
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver/brotherql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 const testUUID = "urn:uuid:00000000-1111-2222-3333-444455556666"
 
+// qlCaps are the Capabilities of the Brother QL driver on the 62 mm roll, the printer the
+// live captures were taken from.
+func qlCaps(mod func(*brotherql.Options)) driver.Capabilities {
+	prof, err := ql.EmbeddedProfile()
+	if err != nil {
+		panic(err)
+	}
+	o := brotherql.Options{Profile: prof, Media: "62", Presets: []int{2900, 5000}, TrimMax: -1}
+	if mod != nil {
+		mod(&o)
+	}
+	d, err := brotherql.New(o)
+	if err != nil {
+		panic(err)
+	}
+	return d.Capabilities()
+}
+
 func testConfig() Config {
-	c := DefaultConfig()
-	c.Name = "Test Label Printer"
-	c.Location = "Test Bench"
-	c.UUID = testUUID
-	return c
+	return Config{
+		Name:     "Test Label Printer",
+		Location: "Test Bench",
+		UUID:     testUUID,
+		Caps:     qlCaps(nil),
+	}
 }
 
 type testServer struct {

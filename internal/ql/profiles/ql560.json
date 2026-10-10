@@ -1,0 +1,284 @@
+{
+  "model": "QL-560",
+  "verified": false,
+  "reference": "Brother QL Series Command Reference (QL-500/550/560/570/580N/650TD/700/1050/1060N) v6.0",
+  "usb_vendor": 1273,
+  "usb_product": 8231,
+  "status_model_byte3": 52,
+  "status_model_byte4": 49,
+  "pins": 720,
+  "bytes_per_line": 90,
+  "dpi": 300,
+  "supports_esc_i_a": false,
+  "supports_compression": false,
+  "no_cut_every": true,
+  "no_expanded_mode": true,
+  "no_high_res": true,
+  "continuous_margin_dots": {
+    "value": [
+      35,
+      1500
+    ],
+    "source": "documented",
+    "note": "feed amount"
+  },
+  "continuous_page_length_dots": {
+    "value": [
+      295,
+      11811
+    ],
+    "source": "documented",
+    "note": "maximum and minimum lengths"
+  },
+  "valid_error_bits": {
+    "err1": [
+      1,
+      2,
+      4,
+      16
+    ],
+    "err2": [
+      1,
+      4,
+      16,
+      64,
+      128
+    ]
+  },
+  "media": [
+    {
+      "id": "62",
+      "name": "62 mm continuous (DK-22205)",
+      "ref_id": 259,
+      "kind": 10,
+      "width_mm": 62,
+      "length_mm": 0,
+      "left_margin_pins": 12,
+      "print_pins": 696,
+      "right_margin_pins": 12,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "29",
+      "name": "29 mm continuous (DK-22210)",
+      "ref_id": 258,
+      "kind": 10,
+      "width_mm": 29,
+      "length_mm": 0,
+      "left_margin_pins": 408,
+      "print_pins": 306,
+      "right_margin_pins": 6,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "12",
+      "name": "12 mm continuous (DK-22214)",
+      "ref_id": 257,
+      "kind": 10,
+      "width_mm": 12,
+      "length_mm": 0,
+      "left_margin_pins": 585,
+      "print_pins": 106,
+      "right_margin_pins": 29,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "38",
+      "name": "38 mm continuous",
+      "ref_id": 264,
+      "kind": 10,
+      "width_mm": 38,
+      "length_mm": 0,
+      "left_margin_pins": 295,
+      "print_pins": 413,
+      "right_margin_pins": 12,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "50",
+      "name": "50 mm continuous",
+      "ref_id": 262,
+      "kind": 10,
+      "width_mm": 50,
+      "length_mm": 0,
+      "left_margin_pins": 154,
+      "print_pins": 554,
+      "right_margin_pins": 12,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "54",
+      "name": "54 mm continuous",
+      "ref_id": 261,
+      "kind": 10,
+      "width_mm": 54,
+      "length_mm": 0,
+      "left_margin_pins": 130,
+      "print_pins": 590,
+      "right_margin_pins": 0,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "17x54",
+      "name": "17x54 mm die-cut",
+      "ref_id": 269,
+      "kind": 11,
+      "width_mm": 17,
+      "length_mm": 54,
+      "left_margin_pins": 555,
+      "print_pins": 165,
+      "right_margin_pins": 0,
+      "print_length_dots": 566,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "17x87",
+      "name": "17x87 mm die-cut",
+      "ref_id": 270,
+      "kind": 11,
+      "width_mm": 17,
+      "length_mm": 87,
+      "left_margin_pins": 555,
+      "print_pins": 165,
+      "right_margin_pins": 0,
+      "print_length_dots": 956,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "23x23",
+      "name": "23x23 mm die-cut (DK-11221)",
+      "ref_id": 370,
+      "kind": 11,
+      "width_mm": 23,
+      "length_mm": 23,
+      "left_margin_pins": 442,
+      "print_pins": 236,
+      "right_margin_pins": 42,
+      "print_length_dots": 202,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "29x90",
+      "name": "29x90 mm die-cut",
+      "ref_id": 271,
+      "kind": 11,
+      "width_mm": 29,
+      "length_mm": 90,
+      "left_margin_pins": 408,
+      "print_pins": 306,
+      "right_margin_pins": 6,
+      "print_length_dots": 991,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "38x90",
+      "name": "38x90 mm die-cut",
+      "ref_id": 272,
+      "kind": 11,
+      "width_mm": 38,
+      "length_mm": 90,
+      "left_margin_pins": 295,
+      "print_pins": 413,
+      "right_margin_pins": 12,
+      "print_length_dots": 991,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "39x48",
+      "name": "39x48 mm die-cut",
+      "ref_id": 367,
+      "kind": 11,
+      "width_mm": 39,
+      "length_mm": 48,
+      "left_margin_pins": 289,
+      "print_pins": 425,
+      "right_margin_pins": 6,
+      "print_length_dots": 495,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "52x29",
+      "name": "52x29 mm die-cut",
+      "ref_id": 374,
+      "kind": 11,
+      "width_mm": 52,
+      "length_mm": 29,
+      "left_margin_pins": 142,
+      "print_pins": 578,
+      "right_margin_pins": 0,
+      "print_length_dots": 271,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "62x29",
+      "name": "62x29 mm die-cut",
+      "ref_id": 274,
+      "kind": 11,
+      "width_mm": 62,
+      "length_mm": 29,
+      "left_margin_pins": 12,
+      "print_pins": 696,
+      "right_margin_pins": 12,
+      "print_length_dots": 271,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "62x100",
+      "name": "62x100 mm die-cut",
+      "ref_id": 275,
+      "kind": 11,
+      "width_mm": 62,
+      "length_mm": 100,
+      "left_margin_pins": 12,
+      "print_pins": 696,
+      "right_margin_pins": 12,
+      "print_length_dots": 1109,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "d12",
+      "name": "12 mm round die-cut (DK-11219)",
+      "ref_id": 362,
+      "kind": 11,
+      "width_mm": 12,
+      "length_mm": 12,
+      "left_margin_pins": 513,
+      "print_pins": 94,
+      "right_margin_pins": 113,
+      "print_length_dots": 94,
+      "fixed_margin_dots": 35,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "d24",
+      "name": "24 mm round die-cut",
+      "ref_id": 363,
+      "kind": 11,
+      "width_mm": 24,
+      "length_mm": 24,
+      "left_margin_pins": 442,
+      "print_pins": 236,
+      "right_margin_pins": 42,
+      "print_length_dots": 236,
+      "x_trim_dots": 0
+    },
+    {
+      "id": "d58",
+      "name": "58 mm round die-cut",
+      "ref_id": 273,
+      "kind": 11,
+      "width_mm": 58,
+      "length_mm": 58,
+      "left_margin_pins": 51,
+      "print_pins": 618,
+      "right_margin_pins": 51,
+      "print_length_dots": 618,
+      "x_trim_dots": 0
+    }
+  ],
+  "mirror": true,
+  "notes": [
+    "Unverified: transcribed from the reference, never printed with.",
+    "The reference lists the QL-560 for ESC i A and ESC i K in one place and not in another; neither is sent."
+  ]
+}

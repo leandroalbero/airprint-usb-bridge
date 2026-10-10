@@ -65,7 +65,11 @@ func TestEmbeddedProfile_equalsShippedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(raw, ql700JSON) {
+	embedded, err := profileFS.ReadFile("profiles/ql700.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, embedded) {
 		t.Fatal("embedded bytes differ from profiles/ql700.json")
 	}
 	if !p.Mirror {

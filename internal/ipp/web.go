@@ -18,10 +18,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+printerPath+"/", s.serveIPP)
 	mux.HandleFunc("GET /{$}", s.serveStatus)
 	mux.HandleFunc("GET /supplies", s.serveStatus)
-	mux.HandleFunc("GET /en.strings", serveStrings)
-	mux.HandleFunc("GET /icon.png", serveIcon(128))
-	mux.HandleFunc("GET /icon-sm.png", serveIcon(48))
-	mux.HandleFunc("GET /icon-lg.png", serveIcon(512))
+	mux.HandleFunc("GET /en.strings", s.serveStrings)
+	doc := s.cfg.Caps.IsDocument()
+	mux.HandleFunc("GET /icon.png", serveIcon(128, doc))
+	mux.HandleFunc("GET /icon-sm.png", serveIcon(48, doc))
+	mux.HandleFunc("GET /icon-lg.png", serveIcon(512, doc))
 	return mux
 }
 
@@ -37,7 +38,7 @@ table{border-collapse:collapse;width:100%}td,th{text-align:left;padding:.25rem .
 <p>{{.MakeModel}}{{if .Location}} &middot; {{.Location}}{{end}}</p>
 <p>State: <b>{{.State}}</b> &middot; {{.Message}}{{range .Reasons}}{{if ne . "none"}} &middot; {{.}}{{end}}{{end}}</p>
 <h2>Jobs</h2>
-{{if .Jobs}}<table><tr><th>#</th><th>Name</th><th>User</th><th>State</th><th>Labels</th><th>Message</th><th>Created</th></tr>
+{{if .Jobs}}<table><tr><th>#</th><th>Name</th><th>User</th><th>State</th><th>{{.Unit}}</th><th>Message</th><th>Created</th></tr>
 {{range .Jobs}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.User}}</td><td>{{.State}}</td><td>{{.Impressions}}</td><td>{{.Message}}</td><td>{{.Created.Format "2006-01-02 15:04:05"}}</td></tr>
 {{end}}</table>{{else}}<p>No jobs.</p>{{end}}
 </body></html>
@@ -51,11 +52,15 @@ func (s *Server) serveStatus(w http.ResponseWriter, r *http.Request) {
 	if len(jobs) > 10 {
 		jobs = jobs[:10]
 	}
+	unit := "Labels"
+	if s.cfg.Caps.IsDocument() {
+		unit = "Pages"
+	}
 	data := struct {
-		Name, MakeModel, Location, State, Message string
-		Reasons                                   []string
-		Jobs                                      []JobInfo
-	}{s.cfg.Name, s.cfg.MakeModel, s.cfg.Location, st.state.String(), st.message, st.reasons, jobs}
+		Name, MakeModel, Location, State, Message, Unit string
+		Reasons                                         []string
+		Jobs                                            []JobInfo
+	}{s.cfg.Name, s.cfg.Caps.MakeModel, s.cfg.Location, st.state.String(), st.message, unit, st.reasons, jobs}
 	var buf bytes.Buffer
 	if err := statusTmpl.Execute(&buf, data); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -67,28 +72,41 @@ func (s *Server) serveStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // en.strings localizes keywords in the attributes; only the roll media type is
-// not a standard keyword.
-const enStrings = `"media-type.roll" = "Roll";
+// not a standard keyword, and a roll's only source is the roll.
+const enStringsRoll = `"media-type.roll" = "Roll";
 "media-source.main" = "Roll";
 `
 
-func serveStrings(w http.ResponseWriter, r *http.Request) {
+const enStringsSheet = `"media-source.main" = "Main";
+`
+
+func (s *Server) serveStrings(w http.ResponseWriter, r *http.Request) {
+	body := enStringsSheet
+	if s.cfg.Caps.Roll != nil {
+		body = enStringsRoll
+	}
 	w.Header().Set("Content-Type", "text/strings; charset=utf-8")
-	_, _ = w.Write([]byte(enStrings))
+	_, _ = w.Write([]byte(body))
+}
+
+type iconKey struct {
+	size int
+	doc  bool
 }
 
 var (
 	iconMu    sync.Mutex
-	iconCache = map[int][]byte{}
+	iconCache = map[iconKey][]byte{}
 )
 
-func serveIcon(size int) http.HandlerFunc {
+func serveIcon(size int, doc bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		k := iconKey{size, doc}
 		iconMu.Lock()
-		b, ok := iconCache[size]
+		b, ok := iconCache[k]
 		if !ok {
-			b = drawIcon(size)
-			iconCache[size] = b
+			b = drawIcon(size, doc)
+			iconCache[k] = b
 		}
 		iconMu.Unlock()
 		w.Header().Set("Content-Type", "image/png")
@@ -96,8 +114,9 @@ func serveIcon(size int) http.HandlerFunc {
 	}
 }
 
-// drawIcon renders a label printer: a dark body with a white label coming out.
-func drawIcon(size int) []byte {
+// drawIcon renders a label printer (a dark body with a white label coming out) or, for doc, a
+// sheet printer with a page in the output tray.
+func drawIcon(size int, doc bool) []byte {
 	img := image.NewNRGBA(image.Rect(0, 0, size, size))
 	body := color.NRGBA{0x3a, 0x3f, 0x47, 0xff}
 	slot := color.NRGBA{0x1e, 0x21, 0x26, 0xff}
@@ -110,11 +129,20 @@ func drawIcon(size int) []byte {
 			}
 		}
 	}
-	fill(0.10, 0.30, 0.90, 0.80, body)
-	fill(0.20, 0.38, 0.80, 0.44, slot)
-	fill(0.25, 0.08, 0.75, 0.41, label)
-	fill(0.32, 0.16, 0.68, 0.20, ink)
-	fill(0.32, 0.25, 0.58, 0.29, ink)
+	if doc {
+		fill(0.08, 0.28, 0.92, 0.72, body)
+		fill(0.18, 0.62, 0.82, 0.66, slot)
+		fill(0.24, 0.10, 0.76, 0.30, label)
+		fill(0.20, 0.64, 0.80, 0.90, label)
+		fill(0.28, 0.72, 0.72, 0.75, ink)
+		fill(0.28, 0.79, 0.62, 0.82, ink)
+	} else {
+		fill(0.10, 0.30, 0.90, 0.80, body)
+		fill(0.20, 0.38, 0.80, 0.44, slot)
+		fill(0.25, 0.08, 0.75, 0.41, label)
+		fill(0.32, 0.16, 0.68, 0.20, ink)
+		fill(0.32, 0.25, 0.58, 0.29, ink)
+	}
 	var buf bytes.Buffer
 	_ = png.Encode(&buf, img)
 	return buf.Bytes()

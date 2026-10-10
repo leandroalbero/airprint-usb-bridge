@@ -1,19 +1,9 @@
-// Package backend sends encoded QL jobs to a printer: usblp through internal/ql, raw TCP 9100,
-// or a dry-run directory.
+// Package backend carries printer bytes: usblp (/dev/usb/lpN), raw TCP (port 9100) and a dry-run
+// directory. It also discovers USB printers through sysfs and their IEEE 1284 device IDs.
 //
-// Printer conditions map to IPP printer-state-reasons keywords (without severity suffix) as follows.
-//
-//	ql status error bit    reasons
-//	no media               media-empty, media-needed
-//	end of media           media-empty, media-needed
-//	media mismatch         media-needed
-//	cutter jam             media-jam
-//	cannot feed            media-jam
-//	cover open             cover-open
-//	main unit in use, fan, transmission, system error, unexpected bits
-//	                       other
-//	no printer / device gone / unsupported OS / no reply
-//	                       offline-report (Condition Offline)
+// Drivers turn pages into bytes; a Transport only delivers them. A driver that needs a
+// status-aware conversation with the printer (the Brother QL) supplies its own sender and may
+// build it on Port.
 //
 // Condition maps to printer-state: Idle and Unknown are idle (3), Busy is processing (4), Offline
 // and Error are stopped (5).
@@ -25,23 +15,30 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 var (
-	// ErrRetryable marks a failure where no byte of the job reached the printer.
+	// ErrRetryable marks a failure where no byte of the unit reached the printer.
 	ErrRetryable = errors.New("retryable")
 	ErrClosed    = errors.New("backend closed")
+
+	ErrNoPrinter     = errors.New("no printer connected")
+	ErrDeviceBusy    = errors.New("device busy")
+	ErrPartial       = errors.New("may have printed partially")
+	ErrTimeout       = errors.New("timeout")
+	ErrUnsupportedOS = errors.New("unsupported on this OS")
 )
 
-// DefaultRetryDeadline is used by PrintWithRetry when deadline <= 0.
+// DefaultRetryDeadline is used by Retry when deadline <= 0.
 const DefaultRetryDeadline = 120 * time.Second
 
-type Backend interface {
-	// Print sends one label as one job. It reports ErrRetryable-wrapped errors only when
-	// nothing reached the printer.
-	Print(ctx context.Context, job ql.Job) error
+// Transport delivers one unit of printer bytes at a time.
+type Transport interface {
+	// Send writes data as one job. It returns an ErrRetryable-wrapped error only when no byte
+	// reached the printer.
+	Send(ctx context.Context, data []byte) error
+	// State reports the printer condition. Device failures are folded into the State; the error
+	// is only for a cancelled context or a closed transport.
 	State(ctx context.Context) (State, error)
 	Close() error
 }
@@ -71,13 +68,17 @@ func (c Condition) String() string {
 	}
 }
 
-// State is a printer snapshot. Device failures are folded into Condition; State methods return a
-// Go error only for a cancelled context or a closed backend.
+// Detail is one extra line for the status command, e.g. {"media", "62 mm"}.
+type Detail struct {
+	Name, Value string
+}
+
+// State is a printer snapshot.
 type State struct {
 	Condition Condition
 	Reasons   []string // IPP keywords without severity suffix; empty means none
 	Message   string
-	Status    *ql.Status // the status reply behind this state, when there was one
+	Details   []Detail
 }
 
 // IPPState is the printer-state enum value.
@@ -112,176 +113,31 @@ func (s State) IPPReasons() []string {
 	return out
 }
 
-var reasonTable = []struct {
-	err     error
-	reasons []string
-}{
-	{ql.ErrNoMedia, []string{"media-empty", "media-needed"}},
-	{ql.ErrEndOfMedia, []string{"media-empty", "media-needed"}},
-	{ql.ErrMediaMismatch, []string{"media-needed"}},
-	{ql.ErrCutterJam, []string{"media-jam"}},
-	{ql.ErrCannotFeed, []string{"media-jam"}},
-	{ql.ErrCoverOpen, []string{"cover-open"}},
-	{ql.ErrMainUnitInUse, []string{"other"}},
-	{ql.ErrFan, []string{"other"}},
-	{ql.ErrTransmission, []string{"other"}},
-	{ql.ErrSystem, []string{"other"}},
-	{ql.ErrPrinter, []string{"other"}},
-	{ql.ErrNoPrinter, []string{"offline-report"}},
-	{ql.ErrDeviceGone, []string{"offline-report"}},
-	{ql.ErrUnsupportedOS, []string{"offline-report"}},
-}
-
-// ReasonsForStatus maps a status reply's error bits.
-func ReasonsForStatus(st ql.Status) []string {
-	var out []string
-	for _, name := range st.Errors {
-		out = appendReasons(out, reasonsForName(name)...)
-	}
-	if len(st.Unexpected) > 0 || (st.Type == ql.StatusError && len(out) == 0) {
-		out = appendReasons(out, "other")
-	}
-	return out
-}
-
-// ReasonsForError maps a Print error from any backend; errors without a printer cause give nil.
-func ReasonsForError(err error) []string {
-	if err == nil {
-		return nil
-	}
-	var out []string
-	for _, r := range reasonTable {
-		if errors.Is(err, r.err) {
-			out = appendReasons(out, r.reasons...)
-		}
-	}
-	return out
-}
-
-func reasonsForName(name string) []string {
-	for _, r := range reasonTable {
-		if r.err.Error() == name {
-			return r.reasons
-		}
-	}
-	return []string{"other"}
-}
-
-func appendReasons(dst []string, rs ...string) []string {
-	for _, r := range rs {
-		dup := false
-		for _, d := range dst {
-			if d == r {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			dst = append(dst, r)
-		}
-	}
-	return dst
-}
-
-// StateFromStatus classifies a status reply.
-func StateFromStatus(st ql.Status) State {
-	s := State{Condition: Idle, Status: &st}
-	if st.Type == ql.StatusError || len(st.Errors) > 0 {
-		s.Condition = Error
-		s.Reasons = ReasonsForStatus(st)
-		msg := append(append([]string(nil), st.Errors...), st.Unexpected...)
-		if len(msg) == 0 {
-			msg = []string{ql.ErrPrinter.Error()}
-		}
-		s.Message = strings.Join(msg, ", ")
-		return s
-	}
-	if st.Printing || (st.Type == ql.StatusNotify && st.Notification == ql.NotifyCoolingStart) {
-		s.Condition = Busy
-	}
-	return s
-}
-
-func stateFromErr(err error) State {
-	if errors.Is(err, ql.ErrDeviceBusy) {
+// StateFromError classifies a failed open or status query.
+func StateFromError(err error) State {
+	if errors.Is(err, ErrDeviceBusy) {
 		return State{Condition: Busy, Message: "in use by another process"}
 	}
 	return State{Condition: Offline, Reasons: []string{"offline-report"}, Message: err.Error()}
 }
 
-func statusErr(st ql.Status) error {
-	var errs []error
-	for _, name := range st.Errors {
-		var e error
-		for _, r := range reasonTable {
-			if r.err.Error() == name {
-				e = r.err
-				break
-			}
-		}
-		if e == nil {
-			e = errors.New(name)
-		}
-		errs = append(errs, e)
-	}
-	for _, u := range st.Unexpected {
-		errs = append(errs, errors.New(u))
-	}
-	if len(errs) == 0 {
-		return ql.ErrPrinter
-	}
-	return errors.Join(errs...)
-}
-
-func retryable(err error) error {
+// Retryable wraps err with ErrRetryable. Use it only when nothing reached the printer.
+func Retryable(err error) error {
 	return fmt.Errorf("%w: %w", ErrRetryable, err)
 }
 
-// JobFor builds one label's job: the bitmap is left-aligned and padded on the right to
-// media.PrintPins, die-cut media is padded in height to PrintLength, and the options are auto-cut
-// after every label and at the end, margin 0, media validation on. A bitmap wider than PrintPins
-// is left as is so Encode rejects it with ql.ErrBitmapWidth.
-func JobFor(prof *ql.Profile, media ql.Media, bitmap *ql.Bitmap, highRes bool) ql.Job {
-	o := ql.DefaultJobOptions()
-	o.MarginDots = 0
-	o.AutoCut = true
-	o.CutEvery = 1
-	o.CutAtEnd = true
-	o.HighRes = highRes
-	o.ValidateMedia = true
-	job := ql.Job{Media: media, Options: o}
-	if bitmap == nil {
-		return job
-	}
-	b := bitmap
-	if b.W < media.PrintPins {
-		b = pad(b, media.PrintPins, b.H)
-	}
-	if media.PrintLength > 0 && b.W <= media.PrintPins && b.H < media.PrintLength {
-		b = pad(b, b.W, media.PrintLength)
-	}
-	job.Pages = []*ql.Bitmap{b}
-	return job
+// Retry calls send until it succeeds or fails with an error that does not wrap ErrRetryable.
+// The backoff starts at 0.5 s and doubles up to 8 s, until deadline (DefaultRetryDeadline when
+// <= 0) has passed since the first attempt. When it gives up the error still wraps ErrRetryable:
+// nothing was printed.
+func Retry(ctx context.Context, send func(context.Context) error, deadline time.Duration, log func(string)) error {
+	return RetryBackoff(ctx, send, deadline, log, 500*time.Millisecond, 8*time.Second)
 }
 
-func pad(src *ql.Bitmap, w, h int) *ql.Bitmap {
-	out := ql.NewBitmap(w, h)
-	for y := 0; y < src.H; y++ {
-		copy(out.Bits[y*w:y*w+src.W], src.Bits[y*src.W:(y+1)*src.W])
-	}
-	return out
-}
-
-// PrintWithRetry retries ErrRetryable failures with a 0.5 s backoff that doubles up to 8 s, until
-// deadline (DefaultRetryDeadline when <= 0) has passed since the first attempt. When it gives up the
-// returned error still wraps ErrRetryable: nothing was printed.
-func PrintWithRetry(ctx context.Context, b Backend, job ql.Job, deadline time.Duration, log func(string)) error {
-	return printWithRetry(ctx, b, job, deadline, log, 500*time.Millisecond, 8*time.Second)
-}
-
-func printWithRetry(ctx context.Context, b Backend, job ql.Job, deadline time.Duration, log func(string), base, max time.Duration) error {
-	if b == nil {
-		return fmt.Errorf("print: nil backend")
+// RetryBackoff is Retry with the first wait base, doubling up to max.
+func RetryBackoff(ctx context.Context, send func(context.Context) error, deadline time.Duration, log func(string), base, max time.Duration) error {
+	if send == nil {
+		return fmt.Errorf("print: nil sender")
 	}
 	if deadline <= 0 {
 		deadline = DefaultRetryDeadline
@@ -292,7 +148,7 @@ func printWithRetry(ctx context.Context, b Backend, job ql.Job, deadline time.Du
 	start := time.Now()
 	wait := base
 	for attempt := 1; ; attempt++ {
-		err := b.Print(ctx, job)
+		err := send(ctx)
 		if err == nil || !errors.Is(err, ErrRetryable) {
 			return err
 		}

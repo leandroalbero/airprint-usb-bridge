@@ -68,6 +68,9 @@ func parseStatus(p *Profile, raw []byte) (Status, error) {
 	s.Err2 = raw[9]
 	s.MediaWidthMM = int(raw[10])
 	s.MediaKind = MediaKind(raw[11])
+	if p != nil {
+		s.MediaKind &^= MediaKind(p.StatusMediaKindBit)
+	}
 	s.MediaLengthMM = int(raw[17])
 	s.Type = StatusType(raw[18])
 	s.Printing = raw[19] == PhasePrinting

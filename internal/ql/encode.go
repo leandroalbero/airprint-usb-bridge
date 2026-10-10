@@ -83,6 +83,12 @@ func validateJob(p *Profile, j Job) error {
 	if j.Options.AutoCut && (j.Options.CutEvery < 1 || j.Options.CutEvery > 255) {
 		return fmt.Errorf("cut every %d", j.Options.CutEvery)
 	}
+	if j.Options.Compress && !p.SupportsCompress {
+		return fmt.Errorf("%s does not support compression", p.Model)
+	}
+	if j.Options.HighRes && (p.NoHighRes || p.NoExpandedMode) {
+		return fmt.Errorf("%s has no high-resolution mode", p.Model)
+	}
 	term := lastTerm(j.Options)
 	if term != TermPrint && term != TermPrintAndFeed {
 		return fmt.Errorf("last terminator 0x%02x", term)
@@ -108,15 +114,20 @@ func lastTerm(o JobOptions) Terminator {
 	return o.LastTerminator
 }
 
-func invalidate() []byte {
-	b := make([]byte, 202)
-	b[200] = 0x1b
-	b[201] = 0x40
+// invalidate is the NUL run that completes any half-sent command, then ESC @.
+func invalidate(p *Profile) []byte {
+	n := 200
+	if p != nil && p.InvalidateBytes > 0 {
+		n = p.InvalidateBytes
+	}
+	b := make([]byte, n+2)
+	b[n] = 0x1b
+	b[n+1] = 0x40
 	return b
 }
 
 func preamble(p *Profile) []byte {
-	b := invalidate()
+	b := invalidate(p)
 	if p != nil && p.SupportsModeCmd {
 		b = append(b, 0x1b, 0x69, 0x61, 0x01)
 	}
@@ -126,18 +137,30 @@ func preamble(p *Profile) []byte {
 func encodePage(p *Profile, j Job, index int, bm *Bitmap, mirror bool) ([]byte, error) {
 	var b []byte
 	b = append(b, printInfo(j, index, bm.H)...)
-	b = append(b, 0x1b, 0x69, 0x4d, variousMode(j.Options))
-	if j.Options.AutoCut {
+	autoCut := j.Options.AutoCut && !p.NoAutoCut
+	o := j.Options
+	o.AutoCut = autoCut
+	b = append(b, 0x1b, 0x69, 0x4d, variousMode(o))
+	if autoCut && !p.NoCutEvery {
 		b = append(b, 0x1b, 0x69, 0x41, byte(j.Options.CutEvery))
 	}
-	b = append(b, 0x1b, 0x69, 0x4b, expandedMode(j.Options))
+	if !p.NoExpandedMode {
+		b = append(b, 0x1b, 0x69, 0x4b, expandedMode(j.Options))
+	}
 	var margin [2]byte
 	binary.LittleEndian.PutUint16(margin[:], uint16(j.Options.MarginDots))
 	b = append(b, 0x1b, 0x69, 0x64, margin[0], margin[1])
+	if j.Options.Compress {
+		b = append(b, 'M', compressTIFF)
+	}
 	for y := 0; y < bm.H; y++ {
 		line, err := packRaster(p, j.Media, bm, y, mirror)
 		if err != nil {
 			return nil, err
+		}
+		if j.Options.Compress {
+			b = appendCompressed(b, line)
+			continue
 		}
 		// {s}=0x00 is "data transmission"; {n} is the byte count. Not a little-endian length.
 		b = append(b, 'g', 0x00, byte(p.BytesPerLine))

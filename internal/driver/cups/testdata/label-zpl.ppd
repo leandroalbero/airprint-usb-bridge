@@ -1,0 +1,64 @@
+*PPD-Adobe: "4.3"
+*% Minimal hand-written PPD for testing the cups driver with a ZPL label filter.
+*FormatVersion: "4.3"
+*FileVersion: "1.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "LABELZPL.PPD"
+*Manufacturer: "Generic"
+*Product: "(Generic ZPL Label Printer)"
+*ModelName: "Generic ZPL Label Printer"
+*ShortNickName: "Generic ZPL Label Printer"
+*NickName: "Generic ZPL Label Printer, test PPD"
+*PSVersion: "(3010.000) 0"
+*LanguageLevel: "3"
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*FileSystem: False
+*Throughput: "4"
+*LandscapeOrientation: Plus90
+*TTRasterizer: Type42
+*cupsVersion: 2.3
+*cupsModelNumber: 18
+*cupsManualCopies: False
+*cupsFilter2: "application/vnd.cups-raster application/vnd.zebra-zpl 50 rastertolabel"
+
+*OpenUI *PageSize/Label Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: w144h72
+*PageSize w144h72/2 x 1 in: "<</PageSize[144 72]/ImagingBBox null>>setpagedevice"
+*PageSize w288h144/4 x 2 in: "<</PageSize[288 144]/ImagingBBox null>>setpagedevice"
+*PageSize w288h432/4 x 6 in: "<</PageSize[288 432]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageSize
+
+*OpenUI *PageRegion/Label Region: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: w144h72
+*PageRegion w144h72/2 x 1 in: "<</PageSize[144 72]/ImagingBBox null>>setpagedevice"
+*PageRegion w288h144/4 x 2 in: "<</PageSize[288 144]/ImagingBBox null>>setpagedevice"
+*PageRegion w288h432/4 x 6 in: "<</PageSize[288 432]/ImagingBBox null>>setpagedevice"
+*CloseUI: *PageRegion
+
+*DefaultImageableArea: w144h72
+*ImageableArea w144h72/2 x 1 in: "0 0 144 72"
+*ImageableArea w288h144/4 x 2 in: "0 0 288 144"
+*ImageableArea w288h432/4 x 6 in: "0 0 288 432"
+*DefaultPaperDimension: w144h72
+*PaperDimension w144h72/2 x 1 in: "144 72"
+*PaperDimension w288h144/4 x 2 in: "288 144"
+*PaperDimension w288h432/4 x 6 in: "288 432"
+
+*OpenUI *Resolution/Resolution: PickOne
+*OrderDependency: 20 AnySetup *Resolution
+*DefaultResolution: 203dpi
+*Resolution 203dpi/203 DPI: "<</HWResolution[203 203]/cupsBitsPerColor 1/cupsColorSpace 3>>setpagedevice"
+*CloseUI: *Resolution
+
+*OpenUI *Darkness/Darkness: PickOne
+*OrderDependency: 20 AnySetup *Darkness
+*DefaultDarkness: Default
+*Darkness Default/Printer Default: "<</cupsCompression -1>>setpagedevice"
+*Darkness Light/Light: "<</cupsCompression 10>>setpagedevice"
+*Darkness Dark/Dark: "<</cupsCompression 25>>setpagedevice"
+*CloseUI: *Darkness
+*% End of label-zpl.ppd

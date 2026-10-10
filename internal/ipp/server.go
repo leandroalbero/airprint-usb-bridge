@@ -115,7 +115,7 @@ func New(cfg Config, proc Processor) (*Server, error) {
 
 func prepareSpool(stateDir string) (string, error) {
 	if stateDir == "" {
-		return os.MkdirTemp("", "ql-airprint-spool-")
+		return os.MkdirTemp("", "airprint-usb-bridge-spool-")
 	}
 	dir := filepath.Join(stateDir, "spool")
 	if err := os.MkdirAll(dir, 0o700); err != nil {

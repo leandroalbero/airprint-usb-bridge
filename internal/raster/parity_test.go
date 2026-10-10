@@ -16,7 +16,7 @@ import (
 	"github.com/leandroalbero/airprint-usb-bridge/internal/raster/testutil"
 )
 
-const referenceScript = "../../testdata/private/reference/ql-airprint-job.py"
+const referenceScript = "../../testdata/private/reference/job.py"
 
 func baseOptions() Options {
 	return Options{Pins: 696, WidthMin: 724, WidthMax: 740, TrimMax: 24, Dither: "auto"}
@@ -42,7 +42,7 @@ var (
 func pythonReference(t *testing.T) string {
 	t.Helper()
 	if _, err := os.Stat(referenceScript); err != nil {
-		t.Skip("reference script not present")
+		t.Skipf("reference script %s not present", referenceScript)
 	}
 	py, err := exec.LookPath("python3")
 	if err != nil {

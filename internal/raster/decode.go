@@ -51,6 +51,9 @@ type Limits struct {
 	// WidthMin and WidthMax are the page widths Prepare accepts, in dots at
 	// 300 dpi. When set, every page header must also say 300 or 600 dpi.
 	WidthMin, WidthMax int
+	// MaxPages caps the page count; <= 0 means no cap. Pages of a few pixels cost little
+	// gray, so the gray cap alone lets a document hold millions of them.
+	MaxPages int
 }
 
 // DecodeLimited is Decode with caps sized for the printer. A page that Prepare
@@ -87,6 +90,9 @@ func decode(data []byte, lim Limits) ([]Page, error) {
 	var pages []Page
 	total := 0
 	add := func(h pageHeader, pos int) (int, error) {
+		if lim.MaxPages > 0 && len(pages) >= lim.MaxPages {
+			return 0, fmt.Errorf("%w: more than %d pages", ErrTooLarge, lim.MaxPages)
+		}
 		if err := checkHeader(h, len(pages)+1); err != nil {
 			return 0, err
 		}

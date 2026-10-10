@@ -431,7 +431,10 @@ func (req *request) readDocument(declared string) (document, *ippError) {
 		return doc, nil
 	}
 	doc.format = sniffFormat(head.Bytes())
-	if doc.format == "" && (declared == formatURF || declared == formatPWG) {
+	if doc.format != "" && doc.format != formatURF && doc.format != formatPWG && !contains(req.s.cfg.Caps.Formats, doc.format) {
+		doc.format = ""
+	}
+	if doc.format == "" && (declared == formatURF || declared == formatPWG || contains(req.s.cfg.Caps.Formats, declared)) {
 		doc.format = declared
 	}
 	if doc.format == "" {
@@ -461,13 +464,18 @@ func (w *headWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// sniffFormat recognizes Apple raster and PWG raster by their sync words.
+// sniffFormat recognizes Apple raster and PWG raster by their sync words, and PDF and PostScript
+// for drivers that take them as they are.
 func sniffFormat(head []byte) string {
 	switch {
 	case bytes.HasPrefix(head, []byte("UNIRAST\x00")):
 		return formatURF
 	case bytes.HasPrefix(head, []byte("RaS2")):
 		return formatPWG
+	case bytes.HasPrefix(head, []byte("%PDF-")):
+		return "application/pdf"
+	case bytes.HasPrefix(head, []byte("%!")):
+		return "application/postscript"
 	}
 	return ""
 }

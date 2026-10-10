@@ -34,6 +34,9 @@ func (p *Profile) validate() error {
 	if p.DPI <= 0 {
 		return fmt.Errorf("dpi %d", p.DPI)
 	}
+	if p.InvalidateBytes != 0 && p.InvalidateBytes < p.BytesPerLine+3 {
+		return fmt.Errorf("invalidate_bytes %d: must cover one raster line (%d)", p.InvalidateBytes, p.BytesPerLine+3)
+	}
 	if err := checkProvenance("continuous_margin_dots", p.MarginDots.Source); err != nil {
 		return err
 	}

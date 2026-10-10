@@ -9,13 +9,11 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-
-	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 type dryRun struct {
-	prof *ql.Profile
-	dir  string
+	dir     string
+	inspect func([]byte) (string, error)
 
 	mu      sync.Mutex
 	last    int
@@ -23,26 +21,26 @@ type dryRun struct {
 	closed  atomic.Bool
 }
 
-// NewDryRun writes each job to dir as job-<n>.bin (the exact bytes a printer would get) and
-// job-<n>.txt (ql.Decode). Numbering continues after the highest job-<n>.bin already in dir.
-func NewDryRun(prof *ql.Profile, dir string) Backend {
-	return &dryRun{prof: prof, dir: dir}
+// NewDryRun writes each unit to dir as job-<n>.bin (the exact bytes a printer would get) and, when
+// inspect is non-nil, job-<n>.txt with its output. Numbering continues after the highest
+// job-<n>.bin already in dir.
+func NewDryRun(dir string, inspect func([]byte) (string, error)) Transport {
+	return &dryRun{dir: dir, inspect: inspect}
 }
 
-func (d *dryRun) Print(ctx context.Context, job ql.Job) error {
+func (d *dryRun) Send(ctx context.Context, data []byte) error {
 	if d.closed.Load() {
 		return ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	bin, err := ql.NewEncoder().Encode(d.prof, job)
-	if err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-	text, err := ql.Decode(bin)
-	if err != nil {
-		text = "decode: " + err.Error()
+	var text string
+	if d.inspect != nil {
+		var err error
+		if text, err = d.inspect(data); err != nil {
+			text = "decode: " + err.Error()
+		}
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -55,11 +53,13 @@ func (d *dryRun) Print(ctx context.Context, job ql.Job) error {
 	}
 	n := d.last + 1
 	base := filepath.Join(d.dir, fmt.Sprintf("job-%d", n))
-	if err := os.WriteFile(base+".bin", bin, 0o600); err != nil {
+	if err := os.WriteFile(base+".bin", data, 0o600); err != nil {
 		return fmt.Errorf("dry-run: %w", err)
 	}
-	if err := os.WriteFile(base+".txt", []byte(text+"\n"), 0o600); err != nil {
-		return fmt.Errorf("dry-run: %w", err)
+	if d.inspect != nil {
+		if err := os.WriteFile(base+".txt", []byte(text+"\n"), 0o600); err != nil {
+			return fmt.Errorf("dry-run: %w", err)
+		}
 	}
 	d.last = n
 	return nil

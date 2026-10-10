@@ -8,6 +8,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver/brotherql"
 )
 
 const privateDir = "../../testdata/private"
@@ -96,9 +99,14 @@ func TestAttributeParityLive(t *testing.T) {
 // A2 is the same printer with high-res, a 100 mm preset and zero margins.
 func TestAttributeParityHighRes(t *testing.T) {
 	cfg := testConfig()
-	cfg.HighRes = true
-	cfg.Presets = []int{2900, 5000, 10000}
-	cfg.Margins = Margins{}
+	cfg.Caps = qlCaps(func(o *brotherql.Options) {
+		o.HighRes = true
+		o.Presets = []int{2900, 5000, 10000}
+	})
+	cfg.Caps.Roll.Margins = driver.Margins{}
+	for i := range cfg.Caps.Media {
+		cfg.Caps.Media[i].Margins = driver.Margins{}
+	}
 	parityAgainst(t, "get-printer-attributes-A2.txt", cfg)
 }
 
@@ -116,7 +124,7 @@ func parityAgainst(t *testing.T, file string, cfg Config) {
 	}
 	cfg.Name = lookupDump(want, "printer-name")
 	cfg.Location = lookupDump(want, "printer-location")
-	cfg.MakeModel = lookupDump(want, "printer-make-and-model")
+	cfg.Caps.MakeModel = lookupDump(want, "printer-make-and-model")
 	cfg.UUID = lookupDump(want, "printer-uuid")
 	ts := startServer(t, cfg, (&recorder{}).process)
 

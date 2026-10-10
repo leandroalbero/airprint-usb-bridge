@@ -18,17 +18,33 @@ type Value[T any] struct {
 
 // Profile is loaded from profiles/<model>.json; nothing model-specific is hard-coded.
 type Profile struct {
-	Model             string                    `json:"model"`
-	USBVendor         uint16                    `json:"usb_vendor"`
-	USBProduct        uint16                    `json:"usb_product"`
-	USBProductEditor  uint16                    `json:"usb_product_editor_lite"`
-	StatusModelByte3  byte                      `json:"status_model_byte3"`
-	StatusModelByte4  byte                      `json:"status_model_byte4"`
-	Pins              int                       `json:"pins"`
-	BytesPerLine      int                       `json:"bytes_per_line"`
-	DPI               int                       `json:"dpi"`
-	SupportsModeCmd   bool                      `json:"supports_esc_i_a"`
-	SupportsCompress  bool                      `json:"supports_compression"`
+	Model string `json:"model"`
+	// Verified means printed with on real hardware; use IsVerified.
+	Verified         *bool    `json:"verified,omitempty"`
+	Reference        string   `json:"reference,omitempty"`
+	Notes            []string `json:"notes,omitempty"`
+	USBVendor        uint16   `json:"usb_vendor"`
+	USBProduct       uint16   `json:"usb_product"`
+	USBProductEditor uint16   `json:"usb_product_editor_lite"`
+	StatusModelByte3 byte     `json:"status_model_byte3"`
+	StatusModelByte4 byte     `json:"status_model_byte4"`
+	Pins             int      `json:"pins"`
+	BytesPerLine     int      `json:"bytes_per_line"`
+	DPI              int      `json:"dpi"`
+	SupportsModeCmd  bool     `json:"supports_esc_i_a"`
+	SupportsCompress bool     `json:"supports_compression"`
+	// The command-support flags are negative so that a profile written before they existed
+	// (the QL-700, user JSON files) keeps sending every command.
+	InvalidateBytes int  `json:"invalidate_bytes,omitempty"` // NULs before ESC @; 0 means 200
+	NoAutoCut       bool `json:"no_auto_cut,omitempty"`      // no cutter: ESC i M never sets auto-cut
+	NoCutEvery      bool `json:"no_cut_every,omitempty"`     // ESC i A not supported
+	NoExpandedMode  bool `json:"no_expanded_mode,omitempty"` // ESC i K not supported
+	NoHighRes       bool `json:"no_high_res,omitempty"`      // no 300x600 mode
+	// StatusMediaKindBit is set in the status media type on models that report 4Ah/4Bh where
+	// ESC i z takes 0Ah/0Bh (QL-600/7x0W/8xx); it is cleared before media matching.
+	StatusMediaKindBit byte `json:"status_media_kind_flag,omitempty"`
+	// TwoColor marks red/black capable heads. Only black is ever printed.
+	TwoColor          bool                      `json:"two_color,omitempty"`
 	MarginDots        Value[[2]int]             `json:"continuous_margin_dots"`
 	PageLengthDots    Value[[2]int]             `json:"continuous_page_length_dots"`
 	LeadingBlankDots  Value[int]                `json:"leading_blank_dots"`
@@ -37,7 +53,7 @@ type Profile struct {
 	Media             []Media                   `json:"media"`
 	Settings          []PrinterSetting          `json:"settings,omitempty"`
 	Extra             map[string]Value[float64] `json:"extra,omitempty"`
-	// Mirror reverses the 720-pin line after Brother ref packing.
+	// Mirror reverses the head-width line after Brother ref packing.
 	// false (JSON omit) is the ref order: pin 0 is byte 0 bit 7, the right edge of the label as it exits.
 	Mirror bool `json:"mirror,omitempty"`
 }
@@ -52,6 +68,18 @@ type PrinterSetting struct {
 type PrinterSettingVal struct {
 	ID    string `json:"id"`
 	Value byte   `json:"value"`
+}
+
+// IsVerified reports a profile tested on hardware. A file without the key predates it and
+// counts as verified only for the QL-700, the one model that was.
+func (p *Profile) IsVerified() bool {
+	if p == nil {
+		return false
+	}
+	if p.Verified != nil {
+		return *p.Verified
+	}
+	return p.Model == "QL-700"
 }
 
 func (p *Profile) SettingByID(id string) (PrinterSetting, bool) {
@@ -137,6 +165,8 @@ type JobOptions struct {
 	HighRes         bool       `json:"high_res"`
 	ValidateMedia   bool       `json:"validate_media"`
 	LastTerminator  Terminator `json:"last_terminator"`
+	// Compress sends TIFF (PackBits) raster lines and Z for blank lines; the profile must support it.
+	Compress bool `json:"compress,omitempty"`
 }
 
 func DefaultJobOptions() JobOptions {

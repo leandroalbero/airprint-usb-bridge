@@ -29,6 +29,9 @@ func NewEncoder() Encoder { return &RasterEncoder{} }
 // ParseStatus decodes a 32-byte status using the profile's valid error bits.
 func ParseStatus(p *Profile, raw []byte) (Status, error) { return parseStatus(p, raw) }
 
+// Invalidate is the byte run that abandons a half-sent job: the profile's NUL count, then ESC @.
+func Invalidate(p *Profile) []byte { return invalidate(p) }
+
 // Decode renders a byte stream as human-readable commands for dry runs.
 func Decode(b []byte) (string, error) { return decode(b) }
 

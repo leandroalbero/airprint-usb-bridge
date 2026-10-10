@@ -95,7 +95,7 @@ func (pr *Printer) cancel(dev Device, res JobResult, sent, idle bool) JobResult 
 	if !idle || dev == nil {
 		return res
 	}
-	if _, err := dev.Write(invalidate()); err != nil {
+	if _, err := dev.Write(invalidate(pr.profile)); err != nil {
 		res.Err = fmt.Errorf("%w: %w", ErrPartial, deviceErr(err))
 	}
 	return res

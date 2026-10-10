@@ -6,6 +6,8 @@ import (
 	"io"
 	"sync"
 	"time"
+
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver"
 )
 
 // JobState is the IPP job-state enum.
@@ -77,6 +79,10 @@ type JobAttrs struct {
 	Orientation  int // 3 portrait, 4 landscape, 0 when absent
 	ColorMode    string
 	Scaling      string
+	Sides        string // "" when absent
+	// Resolved is the offered media that media-col or media matched; zero when the client
+	// sent neither (see driver.Capabilities.Default).
+	Resolved driver.Media
 }
 
 type Job struct {

@@ -147,7 +147,7 @@ func (pr *Printer) invalidateWhenIdle(ctx context.Context, dev Device, res JobRe
 			return res
 		}
 	}
-	if _, err := dev.Write(invalidate()); err != nil {
+	if _, err := dev.Write(invalidate(pr.profile)); err != nil {
 		res.Err = fmt.Errorf("%w: %w", ErrPartial, deviceErr(err))
 		res.State = JobFailed
 	}

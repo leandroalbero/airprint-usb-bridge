@@ -1,15 +1,10 @@
 package ipp
 
 import (
-	"regexp"
-	"strconv"
-
 	"github.com/OpenPrinting/goipp"
-)
 
-// rollTolerance is how far a media-col x-dimension may be from the roll width
-// (1 mm): clients round 62 mm media differently.
-const rollTolerance = 100
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver"
+)
 
 // textValue returns a text or name value, with or without language.
 func textValue(a *goipp.Attribute) (string, bool) {
@@ -49,7 +44,7 @@ func (req *request) userName() string {
 // req.unsupported; they fail the request only with ipp-attribute-fidelity=true.
 func (req *request) checkJobRequest() (jobRequest, *ippError) {
 	jr := jobRequest{name: "Untitled", user: req.userName()}
-	jr.attrs = JobAttrs{Copies: 1, PrintQuality: 4}
+	jr.attrs = JobAttrs{Copies: 1, PrintQuality: req.s.cfg.Caps.DefaultQuality()}
 	if a := find(req.ops, "job-name"); a != nil {
 		n, ok := textValue(a)
 		if !ok {
@@ -102,7 +97,7 @@ func (req *request) checkDocumentOps(format *string) *ippError {
 		if !ok {
 			return fail(goipp.StatusErrorBadRequest, "Bad document-format.")
 		}
-		if !contains(formatsSupported, f) {
+		if !contains(req.s.cfg.documentFormats(), f) {
 			req.unsupported.Add(*a)
 			return fail(goipp.StatusErrorDocumentFormatNotSupported, "Unsupported document-format %q.", f)
 		}
@@ -126,7 +121,10 @@ func (s *Server) checkTemplateAttr(a *goipp.Attribute, ja *JobAttrs) bool {
 	switch a.Name {
 	case "copies":
 		n, ok := singleInt(a, goipp.TagInteger)
-		return ok && n == 1
+		if !ok || n < 1 || n > max(s.cfg.Caps.MaxCopies, 1) {
+			return false
+		}
+		ja.Copies = n
 	case "finishings":
 		for _, v := range a.Values {
 			if n, ok := v.V.(goipp.Integer); !ok || v.T != goipp.TagEnum || n != 3 {
@@ -136,7 +134,10 @@ func (s *Server) checkTemplateAttr(a *goipp.Attribute, ja *JobAttrs) bool {
 		return len(a.Values) > 0
 	case "sides":
 		v, ok := single(a, goipp.TagKeyword)
-		return ok && v == "one-sided"
+		if !ok || !contains(s.cfg.Caps.SidesSupported(), v) {
+			return false
+		}
+		ja.Sides = v
 	case "job-sheets":
 		v, ok := single(a, goipp.TagKeyword, goipp.TagName)
 		return ok && v == "none"
@@ -154,7 +155,7 @@ func (s *Server) checkTemplateAttr(a *goipp.Attribute, ja *JobAttrs) bool {
 		ja.Orientation = n
 	case "print-color-mode":
 		v, ok := single(a, goipp.TagKeyword)
-		if !ok || !contains(colorModesSupported, v) {
+		if !ok || !contains(s.cfg.Caps.ColorModes(), v) {
 			return false
 		}
 		ja.ColorMode = v
@@ -166,7 +167,7 @@ func (s *Server) checkTemplateAttr(a *goipp.Attribute, ja *JobAttrs) bool {
 		ja.Scaling = v
 	case "print-quality":
 		n, ok := singleInt(a, goipp.TagEnum)
-		if !ok || (n != 4 && !(n == 5 && s.cfg.HighRes)) {
+		if !ok || !containsInt(s.cfg.Caps.Qualities, n) {
 			return false
 		}
 		ja.PrintQuality = n
@@ -178,19 +179,23 @@ func (s *Server) checkTemplateAttr(a *goipp.Attribute, ja *JobAttrs) bool {
 		if !ok || r.Units != goipp.UnitsDpi {
 			return false
 		}
-		switch {
-		case r.Xres == 300 && r.Yres == 300:
-		case s.cfg.HighRes && r.Yres == 600 && (r.Xres == 300 || r.Xres == 600):
-		default:
+		if !s.cfg.Caps.AcceptsResolution(driver.Resolution{X: r.Xres, Y: r.Yres}) {
 			return false
 		}
 		ja.XDPI, ja.YDPI = r.Xres, r.Yres
 	case "media":
 		v, ok := single(a, goipp.TagKeyword, goipp.TagName)
-		if !ok || !s.mediaNameOK(v) {
+		if !ok {
+			return false
+		}
+		m, ok := s.cfg.Caps.LookupName(v)
+		if !ok {
 			return false
 		}
 		ja.Media = v
+		if ja.MediaCol == nil {
+			ja.Resolved = m
+		}
 	case "media-col":
 		if len(a.Values) != 1 || a.Values[0].T != goipp.TagBeginCollection {
 			return false
@@ -199,88 +204,78 @@ func (s *Server) checkTemplateAttr(a *goipp.Attribute, ja *JobAttrs) bool {
 		if !ok {
 			return false
 		}
-		mc, ok := s.checkMediaCol(col)
+		mc, m, ok := s.checkMediaCol(col)
 		if !ok {
 			return false
 		}
 		ja.MediaCol = &mc
+		ja.Resolved = m
 	}
 	return true
 }
 
-// lengthOK accepts a label length inside the roll range or equal to a preset.
-func (s *Server) lengthOK(y int) bool {
-	if y >= s.cfg.RollMinLength && y <= s.cfg.RollMaxLength {
-		return true
-	}
-	for _, p := range s.cfg.Presets {
-		if y == p {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) widthOK(x int) bool {
-	return x >= s.cfg.RollWidth-rollTolerance && x <= s.cfg.RollWidth+rollTolerance
-}
-
-// checkMediaCol accepts a media-col for the loaded roll: x-dimension within
-// 1 mm of the roll width and y-dimension inside the roll range or equal to a
-// preset. Margins, source and type are not checked: iOS sends zero margins and
-// no source or type, and there is only one way to feed a roll.
-func (s *Server) checkMediaCol(col goipp.Collection) (MediaCol, bool) {
+// checkMediaCol accepts a media-col whose size the printer offers: on a roll, an x-dimension
+// within 1 mm of the roll width and a y-dimension inside the roll range (as a number or a range)
+// or equal to a preset; otherwise a fixed size within 1 mm on both axes. Margins, source and type
+// are not checked: iOS sends zero margins and no source or type.
+func (s *Server) checkMediaCol(col goipp.Collection) (MediaCol, driver.Media, bool) {
 	var mc MediaCol
+	var media driver.Media
+	caps := &s.cfg.Caps
 	sized := false
 	for i := range col {
 		m := &col[i]
 		switch m.Name {
 		case "media-size":
 			if len(m.Values) != 1 {
-				return mc, false
+				return mc, media, false
 			}
 			size, ok := m.Values[0].V.(goipp.Collection)
 			if !ok {
-				return mc, false
+				return mc, media, false
 			}
 			var hasX, hasY bool
+			var yRange *goipp.Range
 			for k := range size {
 				d := &size[k]
 				if len(d.Values) != 1 {
-					return mc, false
+					return mc, media, false
 				}
 				switch d.Name {
 				case "x-dimension":
 					x, ok := d.Values[0].V.(goipp.Integer)
-					if !ok || !s.widthOK(int(x)) {
-						return mc, false
+					if !ok || !caps.MatchWidth(int(x)) {
+						return mc, media, false
 					}
 					mc.XDimension, hasX = int(x), true
 				case "y-dimension":
 					switch y := d.Values[0].V.(type) {
 					case goipp.Integer:
-						if !s.lengthOK(int(y)) {
-							return mc, false
-						}
 						mc.YDimension = int(y)
 					case goipp.Range:
-						if y.Lower < s.cfg.RollMinLength || y.Upper > s.cfg.RollMaxLength || y.Lower > y.Upper {
-							return mc, false
-						}
+						yRange = &y
 					default:
-						return mc, false
+						return mc, media, false
 					}
 					hasY = true
 				}
 			}
 			if !hasX || !hasY {
-				return mc, false
+				return mc, media, false
+			}
+			if yRange != nil {
+				media, ok = caps.MatchRange(mc.XDimension, yRange.Lower, yRange.Upper)
+			} else {
+				media, ok = caps.MatchSize(mc.XDimension, mc.YDimension)
+			}
+			if !ok {
+				return mc, media, false
 			}
 			sized = true
 		case "media-size-name":
 			v, ok := single(m, goipp.TagKeyword, goipp.TagName)
 			if !ok {
-				return mc, false
+				return mc, media, false
 			}
 			mc.SizeName = v
 		case "media-source":
@@ -297,38 +292,24 @@ func (s *Server) checkMediaCol(col goipp.Collection) (MediaCol, bool) {
 			mc.Right, _ = singleInt(m, goipp.TagInteger)
 		}
 	}
-	if !sized && mc.SizeName != "" && !s.mediaNameOK(mc.SizeName) {
-		return mc, false
+	if !sized {
+		if mc.SizeName == "" {
+			return mc, caps.Default(), true
+		}
+		m, ok := caps.LookupName(mc.SizeName)
+		if !ok {
+			return mc, media, false
+		}
+		media = m
 	}
-	return mc, true
+	return mc, media, true
 }
 
-var pwgMediaName = regexp.MustCompile(`^[a-z0-9]+_[a-z0-9.-]*_([0-9]+(?:\.[0-9]+)?)x([0-9]+(?:\.[0-9]+)?)(mm|in)$`)
-
-// mediaNameOK accepts the advertised media keywords and any PWG self-describing
-// name whose size fits the roll.
-func (s *Server) mediaNameOK(name string) bool {
-	if contains(s.cfg.mediaSupported(), name) || contains(s.cfg.mediaReady(), name) {
-		return true
+func containsInt(list []int, n int) bool {
+	for _, x := range list {
+		if x == n {
+			return true
+		}
 	}
-	m := pwgMediaName.FindStringSubmatch(name)
-	if m == nil {
-		return false
-	}
-	x, y := toHundredthsMM(m[1], m[3]), toHundredthsMM(m[2], m[3])
-	if x < 0 || y < 0 {
-		return false
-	}
-	return s.widthOK(x) && s.lengthOK(y)
-}
-
-func toHundredthsMM(v, unit string) int {
-	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
-		return -1
-	}
-	if unit == "in" {
-		f *= 25.4
-	}
-	return int(f*100 + 0.5)
+	return false
 }

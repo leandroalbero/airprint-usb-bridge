@@ -61,14 +61,12 @@ func decodeCmd(b []byte, i int) (string, int, bool) {
 		return "print", i + 1, true
 	case 0x1a:
 		return "print-and-feed", i + 1, true
-	case 'Z':
-		return "zero-raster", i + 1, true
 	case 'M':
 		if i+1 >= len(b) {
 			return fmt.Sprintf("truncated compression at %d", i), len(b), true
 		}
 		return fmt.Sprintf("compression 0x%02x", b[i+1]), i + 2, true
-	case 'g':
+	case 'g', 'Z':
 		return decodeRaster(b, i)
 	case 0x1b:
 		return decodeESC(b, i)
@@ -77,10 +75,17 @@ func decodeCmd(b []byte, i int) (string, int, bool) {
 	}
 }
 
+// decodeRaster counts a run of raster lines; Z (a blank line in compression mode) is part of it.
 func decodeRaster(b []byte, i int) (string, int, bool) {
-	count := 0
+	count, zero := 0, 0
 	j := i
-	for j < len(b) && b[j] == 'g' {
+	for j < len(b) && (b[j] == 'g' || b[j] == 'Z') {
+		if b[j] == 'Z' {
+			j++
+			count++
+			zero++
+			continue
+		}
 		if j+2 >= len(b) || j+3+int(b[j+2]) > len(b) {
 			if count == 0 {
 				return fmt.Sprintf("truncated raster at %d", i), len(b), true
@@ -92,6 +97,9 @@ func decodeRaster(b []byte, i int) (string, int, bool) {
 	}
 	if count == 0 {
 		return fmt.Sprintf("truncated raster at %d", i), len(b), true
+	}
+	if zero > 0 {
+		return fmt.Sprintf("raster-lines %d (%d zero)", count, zero), j, true
 	}
 	return fmt.Sprintf("raster-lines %d", count), j, true
 }

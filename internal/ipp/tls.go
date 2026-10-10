@@ -97,7 +97,7 @@ func newSelfSigned(hosts []string) (certPEM, keyPEM []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	cn := "ql-airprint"
+	cn := "airprint-usb-bridge"
 	for _, h := range hosts {
 		if net.ParseIP(h) == nil && h != "localhost" {
 			cn = h
@@ -106,7 +106,7 @@ func newSelfSigned(hosts []string) (certPEM, keyPEM []byte, err error) {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: cn, Organization: []string{"ql-airprint"}},
+		Subject:               pkix.Name{CommonName: cn, Organization: []string{"airprint-usb-bridge"}},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().AddDate(10, 0, 0),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,

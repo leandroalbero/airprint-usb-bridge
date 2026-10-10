@@ -24,6 +24,7 @@ func DecodeRaster(p *Profile, m Media, b []byte) ([]*Bitmap, error) {
 		pages = append(pages, bm)
 		lines = nil
 	}
+	compressed := false
 	for i := 0; i < len(b); {
 		if b[i] == 'g' {
 			if i+2 >= len(b) {
@@ -33,8 +34,25 @@ func DecodeRaster(p *Profile, m Media, b []byte) ([]*Bitmap, error) {
 			if i+3+n > len(b) {
 				return nil, fmt.Errorf("decode raster: truncated line at %d", i)
 			}
-			lines = append(lines, append([]byte(nil), b[i+3:i+3+n]...))
+			line := append([]byte(nil), b[i+3:i+3+n]...)
+			if compressed {
+				var err error
+				if line, err = unpackBits(line, p.BytesPerLine); err != nil {
+					return nil, fmt.Errorf("decode raster: line at %d: %w", i, err)
+				}
+			}
+			lines = append(lines, line)
 			i += 3 + n
+			continue
+		}
+		if b[i] == 'Z' {
+			lines = append(lines, make([]byte, p.BytesPerLine))
+			i++
+			continue
+		}
+		if b[i] == 'M' && i+1 < len(b) {
+			compressed = b[i+1] == compressTIFF
+			i += 2
 			continue
 		}
 		if b[i] == byte(TermPrint) || b[i] == byte(TermPrintAndFeed) {

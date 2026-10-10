@@ -1,0 +1,22 @@
+UEL
+@PJL JOB NAME="hello"
+@PJL SET RESOLUTION=300
+@PJL ENTER LANGUAGE=PCL
+ESC E (reset)
+ESC &l26A (page size a4)
+ESC &l0O (orientation)
+ESC &l0L (perforation skip)
+ESC &l0E (top margin)
+ESC *t300R (raster resolution)
+ESC *p0X (cursor x)
+ESC *p0Y (cursor y)
+ESC *r2338S (raster width)
+ESC *b2M (compression mode)
+ESC *r1A (start raster graphics)
+  raster: 2 rows sent (8 bytes), 100 rows skipped
+ESC *rB (end raster graphics)
+FF (page 1)
+ESC E (reset)
+UEL
+@PJL EOJ NAME="hello"
+UEL

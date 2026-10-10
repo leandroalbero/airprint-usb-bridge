@@ -1,23 +1,15 @@
-// Package ipp is an IPP/2.0 (IPP Everywhere / AirPrint) server for a
-// continuous-roll label printer.
+// Package ipp is an IPP/2.0 (IPP Everywhere / AirPrint) server. The printer it presents is
+// described by driver.Capabilities: a continuous-roll label printer or a document printer.
 package ipp
 
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
-)
 
-type MediaPolicy string
-
-const (
-	// MediaRoll advertises only the roll as loaded media.
-	MediaRoll MediaPolicy = "roll"
-	// MediaRollPresets also advertises the preset label lengths as loaded media.
-	// iOS then shows a paper menu, but apps that pick the "best" loaded paper
-	// stop using the roll.
-	MediaRollPresets MediaPolicy = "roll+presets"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver"
 )
 
 // PrinterState is the IPP printer-state enum.
@@ -49,32 +41,15 @@ type DeviceStatus struct {
 	Message string
 }
 
-// Margins are in hundredths of a millimetre.
-type Margins struct {
-	Top, Bottom, Left, Right int
-}
-
 type Config struct {
-	Name      string // printer-name, printer-info, printer-dns-sd-name
-	Location  string
-	MakeModel string // e.g. "Brother QL-700"
-	DeviceID  string // IEEE 1284 device ID; derived from MakeModel when empty
-	UUID      string // "urn:uuid:..." or a bare UUID
-	Host      string // used in URIs only when a request has no Host header
-	Port      int    // used in URIs when the Host header has no port; 0 = the listener's port
+	Name     string // printer-name, printer-info, printer-dns-sd-name
+	Location string
+	UUID     string // "urn:uuid:..." or a bare UUID
+	Host     string // used in URIs only when a request has no Host header
+	Port     int    // used in URIs when the Host header has no port; 0 = the listener's port
 
-	// Media dimensions are in hundredths of a millimetre, as in media-col.
-	RollWidth     int   // 6200 for 62 mm
-	RollMinLength int   // 800
-	RollMaxLength int   // 100000
-	DefaultLength int   // media-col-default y-dimension, 10000
-	Presets       []int // fixed label lengths, e.g. 2900, 5000
-	MediaPolicy   MediaPolicy
-	Margins       Margins
-	TrayName      string // printer-input-tray medianame; "<width>mm" when empty
-
-	// HighRes advertises print-quality high and 600 dpi (300x600 on the head).
-	HighRes bool
+	// Caps describe the printer; every printer attribute and the TXT record come from them.
+	Caps driver.Capabilities
 
 	// StateDir holds the TLS key pair and the spool. Empty means an in-memory
 	// certificate and os.TempDir for spooling.
@@ -97,54 +72,13 @@ type Config struct {
 	Logf func(format string, args ...any)
 }
 
-// DefaultConfig returns the attribute values the live 62 mm setup was verified with.
-func DefaultConfig() Config {
-	return Config{
-		Name:          "Brother QL-700",
-		MakeModel:     "Brother QL-700",
-		RollWidth:     6200,
-		RollMinLength: 800,
-		RollMaxLength: 100000,
-		DefaultLength: 10000,
-		Presets:       []int{2900, 5000},
-		MediaPolicy:   MediaRoll,
-		Margins:       Margins{Left: 152, Right: 152},
-	}
-}
-
 func (c *Config) normalize() error {
 	if c.Name == "" {
 		return fmt.Errorf("ipp: config: empty Name")
 	}
-	if c.MakeModel == "" {
-		c.MakeModel = c.Name
-	}
-	if c.RollWidth <= 0 {
-		return fmt.Errorf("ipp: config: RollWidth %d", c.RollWidth)
-	}
-	if c.RollMinLength <= 0 {
-		c.RollMinLength = 800
-	}
-	if c.RollMaxLength <= 0 {
-		c.RollMaxLength = 100000
-	}
-	if c.RollMinLength > c.RollMaxLength {
-		return fmt.Errorf("ipp: config: roll length range %d-%d", c.RollMinLength, c.RollMaxLength)
-	}
-	if c.DefaultLength <= 0 {
-		c.DefaultLength = 10000
-	}
-	for _, p := range c.Presets {
-		if p <= 0 {
-			return fmt.Errorf("ipp: config: preset length %d", p)
-		}
-	}
-	switch c.MediaPolicy {
-	case "":
-		c.MediaPolicy = MediaRoll
-	case MediaRoll, MediaRollPresets:
-	default:
-		return fmt.Errorf("ipp: config: media policy %q (want roll or roll+presets)", c.MediaPolicy)
+	c.Caps = cloneCaps(c.Caps)
+	if err := c.Caps.Validate(); err != nil {
+		return fmt.Errorf("ipp: config: %w", err)
 	}
 	if c.UUID == "" {
 		return fmt.Errorf("ipp: config: empty UUID")
@@ -152,15 +86,8 @@ func (c *Config) normalize() error {
 	if !strings.HasPrefix(c.UUID, "urn:uuid:") {
 		c.UUID = "urn:uuid:" + c.UUID
 	}
-	if c.DeviceID == "" {
-		mfg, mdl, ok := strings.Cut(c.MakeModel, " ")
-		if !ok {
-			mfg, mdl = c.MakeModel, c.MakeModel
-		}
-		c.DeviceID = "MFG:" + mfg + ";MDL:" + mdl + ";CMD:URF,PWG;"
-	}
-	if c.TrayName == "" {
-		c.TrayName = mmString(c.RollWidth) + "mm"
+	if c.Caps.DeviceID == "" {
+		c.Caps.DeviceID = deriveDeviceID(&c.Caps)
 	}
 	if c.MaxDocumentBytes <= 0 {
 		c.MaxDocumentBytes = 256 << 20
@@ -174,39 +101,111 @@ func (c *Config) normalize() error {
 	return nil
 }
 
-// mmString formats hundredths of a millimetre as millimetres for PWG media names.
-func mmString(v int) string {
-	s := strconv.Itoa(v / 100)
-	if f := v % 100; f != 0 {
-		s += strings.TrimRight(fmt.Sprintf(".%02d", f), "0")
+// cloneCaps copies the slices so a caller changing its Capabilities later cannot change a
+// running server.
+func cloneCaps(c driver.Capabilities) driver.Capabilities {
+	c.Kind = slices.Clone(c.Kind)
+	c.Resolutions = slices.Clone(c.Resolutions)
+	c.AlsoAccept = slices.Clone(c.AlsoAccept)
+	c.Qualities = slices.Clone(c.Qualities)
+	c.URF = slices.Clone(c.URF)
+	c.PWGTypes = slices.Clone(c.PWGTypes)
+	c.Formats = slices.Clone(c.Formats)
+	c.Media = slices.Clone(c.Media)
+	if c.Roll != nil {
+		r := *c.Roll
+		c.Roll = &r
 	}
-	return s
+	return c
 }
 
-// URFSupported is the urf-supported value, also used for the TXT record's URF key.
-func (c *Config) URFSupported() []string {
-	if c.HighRes {
-		return []string{"V1.4", "W8", "CP1", "PQ4-5", "RS300-600"}
+// deriveDeviceID builds "MFG:<first word>;MDL:<rest>;CMD:URF,PWG[,PDF][,PS];" from MakeModel.
+func deriveDeviceID(c *driver.Capabilities) string {
+	mfg, mdl, ok := strings.Cut(c.MakeModel, " ")
+	if !ok {
+		mfg, mdl = c.MakeModel, c.MakeModel
 	}
-	return []string{"V1.4", "W8", "CP1", "RS300"}
+	cmd := []string{"URF", "PWG"}
+	for _, f := range c.Formats {
+		switch f {
+		case "application/pdf":
+			cmd = append(cmd, "PDF")
+		case "application/postscript":
+			cmd = append(cmd, "PS")
+		}
+	}
+	return "MFG:" + mfg + ";MDL:" + mdl + ";CMD:" + strings.Join(cmd, ",") + ";"
+}
+
+// documentFormats is document-format-supported: octet-stream (sniffed), the raster formats and the
+// driver's pass-through formats, sorted.
+func (c *Config) documentFormats() []string {
+	out := []string{formatOctetStream, formatPWG, formatURF}
+	for _, f := range c.Caps.Formats {
+		if !slices.Contains(out, f) {
+			out = append(out, f)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // TXT returns the DNS-SD TXT record for _ipp._tcp and _ipps._tcp. host and port
 // name this server as clients reach it (the mDNS host name).
 func (c Config) TXT(host string, port int) map[string]string {
 	_ = c.normalize()
-	return map[string]string{
+	var pdl []string
+	for _, f := range c.documentFormats() {
+		if f != formatOctetStream {
+			pdl = append(pdl, f)
+		}
+	}
+	txt := map[string]string{
 		"txtvers":  "1",
 		"qtotal":   "1",
 		"rp":       "ipp/print",
-		"ty":       c.MakeModel,
+		"ty":       c.Caps.MakeModel,
 		"adminurl": fmt.Sprintf("https://%s:%d/", host, port),
 		"note":     c.Location,
-		"pdl":      "image/pwg-raster,image/urf",
-		"Color":    "F",
-		"Duplex":   "F",
+		"pdl":      strings.Join(pdl, ","),
+		"Color":    tf(c.Caps.Color),
+		"Duplex":   tf(c.Caps.Duplex),
 		"UUID":     strings.TrimPrefix(c.UUID, "urn:uuid:"),
 		"TLS":      "1.2",
-		"URF":      strings.Join(c.URFSupported(), ","),
+		"URF":      strings.Join(c.Caps.URF, ","),
 	}
+	if c.Caps.IsDocument() {
+		// Bonjour Printing keys for sheet printers; the label printer keeps the record iOS has
+		// accepted.
+		txt["kind"] = strings.Join(c.Caps.Kind, ",")
+		txt["product"] = "(" + c.Caps.MakeModel + ")"
+		txt["PaperMax"] = paperMax(c.Caps.Media)
+	}
+	return txt
+}
+
+// paperMax is the Bonjour Printing TXT PaperMax class of the largest fixed size.
+func paperMax(media []driver.Media) string {
+	w, l := 0, 0
+	for _, m := range media {
+		w, l = max(w, m.Width), max(l, m.Length)
+	}
+	switch {
+	case w < 21000 || l < 29700:
+		return "<legal-A4"
+	case w < 29700 || l < 42000:
+		return "legal-A4"
+	case w < 42000 || l < 59400:
+		return "tabloid-A3"
+	case w < 59400 || l < 84100:
+		return "isoC-A2"
+	}
+	return ">isoC-A2"
+}
+
+func tf(b bool) string {
+	if b {
+		return "T"
+	}
+	return "F"
 }

@@ -1,5 +1,5 @@
 docs/specs/
 testdata/private/
-/ql-airprint
+/airprint-usb-bridge
 /dist/
 *.prn
