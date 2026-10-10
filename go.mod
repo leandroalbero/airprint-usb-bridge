@@ -1,4 +1,4 @@
-module github.com/leandroalbero/ql-airprint
+module github.com/leandroalbero/airprint-usb-bridge
 
 go 1.24
 

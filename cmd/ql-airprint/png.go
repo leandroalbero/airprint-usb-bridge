@@ -8,7 +8,7 @@ import (
 	"image/png"
 	"os"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 var pngMagic = []byte("\x89PNG\r\n\x1a\n")

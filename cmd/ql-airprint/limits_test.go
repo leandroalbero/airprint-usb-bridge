@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ipp"
-	"github.com/leandroalbero/ql-airprint/internal/ql"
-	"github.com/leandroalbero/ql-airprint/internal/raster"
-	"github.com/leandroalbero/ql-airprint/internal/raster/testutil"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ipp"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster/testutil"
 )
 
 // One label may wait out a cooling pause after a TCP write of up to 2 min; a

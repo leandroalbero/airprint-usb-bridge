@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
-	"github.com/leandroalbero/ql-airprint/internal/raster/testutil"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster/testutil"
 )
 
 func TestParseArgsInterspersed(t *testing.T) {

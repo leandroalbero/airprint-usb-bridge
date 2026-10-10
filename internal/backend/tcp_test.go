@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 func rawStatus(p *ql.Profile, typ ql.StatusType, phase, err1, err2 byte) []byte {

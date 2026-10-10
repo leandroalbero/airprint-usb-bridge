@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/backend"
-	"github.com/leandroalbero/ql-airprint/internal/ipp"
-	"github.com/leandroalbero/ql-airprint/internal/ql"
-	"github.com/leandroalbero/ql-airprint/internal/raster"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/backend"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ipp"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster"
 )
 
 type logFunc func(format string, args ...any)

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 // Read is one scripted ReadStatus result.

@@ -3,7 +3,7 @@ package raster
 import (
 	"testing"
 
-	"github.com/leandroalbero/ql-airprint/internal/raster/testutil"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster/testutil"
 )
 
 func FuzzDecode(f *testing.F) {

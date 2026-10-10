@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 var statusRequest = []byte{0x1b, 0x69, 0x53}

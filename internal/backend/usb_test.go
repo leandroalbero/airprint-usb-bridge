@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
-	"github.com/leandroalbero/ql-airprint/internal/ql/qltest"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql/qltest"
 )
 
 func fastTimeouts() ql.Timeouts {

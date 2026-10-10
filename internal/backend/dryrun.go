@@ -10,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 type dryRun struct {

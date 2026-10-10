@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ipp"
-	"github.com/leandroalbero/ql-airprint/internal/mdns"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ipp"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/mdns"
 )
 
 // service is everything serve needs, built before the listener so tests can run it on

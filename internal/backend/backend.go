@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 var (

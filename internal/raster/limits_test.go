@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/leandroalbero/ql-airprint/internal/raster/testutil"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster/testutil"
 )
 
 var rollLimits = Limits{MaxGrayBytes: 64 << 20, WidthMin: 724, WidthMax: 740}

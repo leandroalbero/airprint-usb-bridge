@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/backend"
-	"github.com/leandroalbero/ql-airprint/internal/ipp"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/backend"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ipp"
 )
 
 // statusCache rate-limits device queries: the ipp server polls every 2 s, but a USB status

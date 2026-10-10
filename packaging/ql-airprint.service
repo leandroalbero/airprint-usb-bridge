@@ -1,6 +1,6 @@
 [Unit]
 Description=Brother QL label printer as an AirPrint / IPP Everywhere printer
-Documentation=https://github.com/leandroalbero/ql-airprint
+Documentation=https://github.com/leandroalbero/airprint-usb-bridge
 After=network-online.target avahi-daemon.service
 Wants=network-online.target
 

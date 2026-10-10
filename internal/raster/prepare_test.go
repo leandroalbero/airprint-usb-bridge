@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/leandroalbero/ql-airprint/internal/raster/testutil"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster/testutil"
 )
 
 func grayPage(w, h, dpi int, g []byte) Page {

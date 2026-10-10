@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/backend"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/backend"
 )
 
 // runPrint sends one file straight to the printer. A PNG is printed as one label, left-aligned

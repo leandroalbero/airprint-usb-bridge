@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
 )
 
 func profile(t *testing.T) *ql.Profile {

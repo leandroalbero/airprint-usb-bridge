@@ -17,8 +17,8 @@ import (
 
 	"github.com/OpenPrinting/goipp"
 
-	"github.com/leandroalbero/ql-airprint/internal/ql"
-	"github.com/leandroalbero/ql-airprint/internal/raster/testutil"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/ql"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/raster/testutil"
 )
 
 // rect is a black rectangle on a synthetic page, in page pixels (x1, y1 exclusive).
