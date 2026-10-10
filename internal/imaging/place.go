@@ -27,6 +27,9 @@ type PlaceOptions struct {
 	// JobInfo.Budget). Place then fails with driver.ErrJobTooLarge instead of running out of
 	// memory on a tiny low-resolution page that scales up to a huge sheet.
 	Budget *driver.Budget
+	// InPlace lets Place draw the sheet over p.Gray and return it, when the page goes on the
+	// sheet 1:1 and p.Gray's capacity holds the sheet; the caller must not use p afterwards.
+	InPlace bool
 }
 
 // Place scales and positions p on a sheet of media's size at the output resolution and returns
@@ -36,12 +39,119 @@ type PlaceOptions struct {
 // When the scale is 1 and the resolutions match, pixels are copied exactly; otherwise each output
 // pixel is the mean of the source pixels it covers (or the nearest one when enlarging).
 func Place(p raster.Page, media driver.Media, o PlaceOptions) (raster.Page, error) {
-	if p.Width <= 0 || p.Height <= 0 || len(p.Gray) != p.Width*p.Height || p.XDPI <= 0 || p.YDPI <= 0 {
-		return raster.Page{}, fmt.Errorf("imaging: malformed page %dx%d @%dx%d with %d gray bytes",
-			p.Width, p.Height, p.XDPI, p.YDPI, len(p.Gray))
+	if len(p.Gray) != p.Width*p.Height {
+		return raster.Page{}, malformed(p)
+	}
+	pl, err := plan(p, media, o)
+	if err != nil {
+		return raster.Page{}, err
+	}
+	if err := o.Budget.Charge(int64(pl.outW) * int64(pl.outH)); err != nil {
+		return raster.Page{}, err
+	}
+	owned := o.InPlace
+	if pl.quarters != 0 {
+		p = Rotate(p, pl.quarters)
+		owned = true
+	}
+	out, ok := raster.Page{}, false
+	if owned && pl.pw == p.Width && pl.ph == p.Height {
+		out, ok = shiftInPlace(p, pl)
+		out.XDPI, out.YDPI = o.XDPI, o.YDPI
+	}
+	if !ok {
+		out = raster.Page{Width: pl.outW, Height: pl.outH, XDPI: o.XDPI, YDPI: o.YDPI, Gray: make([]byte, pl.outW*pl.outH)}
+		for i := range out.Gray {
+			out.Gray[i] = 255
+		}
+		if pl.pw > 0 && pl.ph > 0 {
+			blit(&out, resample(p, pl.pw, pl.ph), pl.ox, pl.oy)
+		}
+	}
+	if !o.KeepMargins {
+		clearMargins(&out, media.Margins, media.Length == 0)
+	}
+	return out, nil
+}
+
+// shiftInPlace places p at 1:1 over its own pixels, when the sheet fits in p.Gray's capacity and
+// every row moves the same way (all forward, or all back), so no row is overwritten before it
+// has moved. It gives what blitting p on a white sheet gives.
+func shiftInPlace(p raster.Page, pl placement) (raster.Page, bool) {
+	w, h, outW, outH, ox, oy := p.Width, p.Height, pl.outW, pl.outH, pl.ox, pl.oy
+	forward := outW >= w && ox >= 0 && oy >= 0
+	back := outW <= w && ox <= 0 && oy <= 0
+	if (!forward && !back) || cap(p.Gray) < outW*outH {
+		return raster.Page{}, false
+	}
+	buf := p.Gray[:max(w*h, outW*outH)]
+	x0, x1 := max(0, -ox), min(w, outW-ox)
+	white := func(b []byte) {
+		for i := range b {
+			b[i] = 255
+		}
+	}
+	move := func(y int) {
+		dy := y + oy
+		if dy < 0 || dy >= outH {
+			return
+		}
+		row := buf[dy*outW : (dy+1)*outW]
+		if x0 >= x1 {
+			white(row)
+			return
+		}
+		copy(row[ox+x0:ox+x1], buf[y*w+x0:y*w+x1])
+		white(row[:ox+x0])
+		white(row[ox+x1:])
+	}
+	if forward {
+		for y := h - 1; y >= 0; y-- {
+			move(y)
+		}
+		white(buf[:min(oy, outH)*outW])
+	} else {
+		for y := 0; y < h; y++ {
+			move(y)
+		}
+	}
+	white(buf[max(0, min(oy+h, outH))*outW : outW*outH])
+	return raster.Page{Width: outW, Height: outH, Gray: buf[:outW*outH]}, true
+}
+
+// CheckPlace reports the error Place would return for a page of p's size and resolution, without
+// placing it; p.Gray may be nil. The sheet is checked against the whole Budget, not charged:
+// a driver that streams pages releases each sheet before placing the next.
+func CheckPlace(p raster.Page, media driver.Media, o PlaceOptions) error {
+	if p.Gray != nil && len(p.Gray) != p.Width*p.Height {
+		return malformed(p)
+	}
+	pl, err := plan(p, media, o)
+	if err != nil {
+		return err
+	}
+	return o.Budget.Check(int64(pl.outW) * int64(pl.outH))
+}
+
+func malformed(p raster.Page) error {
+	return fmt.Errorf("imaging: malformed page %dx%d @%dx%d with %d gray bytes", p.Width, p.Height, p.XDPI, p.YDPI, len(p.Gray))
+}
+
+// placement is where Place puts a page: turned by quarters, scaled to pw x ph and drawn at
+// (ox, oy) on an outW x outH sheet.
+type placement struct {
+	quarters       int
+	pw, ph, ox, oy int
+	outW, outH     int
+}
+
+func plan(p raster.Page, media driver.Media, o PlaceOptions) (placement, error) {
+	var pl placement
+	if p.Width <= 0 || p.Height <= 0 || p.XDPI <= 0 || p.YDPI <= 0 {
+		return pl, malformed(p)
 	}
 	if o.XDPI <= 0 || o.YDPI <= 0 || media.Width <= 0 || media.Length < 0 {
-		return raster.Page{}, fmt.Errorf("imaging: bad target %dx%d dpi on %dx%d", o.XDPI, o.YDPI, media.Width, media.Length)
+		return pl, fmt.Errorf("imaging: bad target %dx%d dpi on %dx%d", o.XDPI, o.YDPI, media.Width, media.Length)
 	}
 
 	pageLandscape := float64(p.Width)/float64(p.XDPI) > float64(p.Height)/float64(p.YDPI)
@@ -49,16 +159,20 @@ func Place(p raster.Page, media driver.Media, o PlaceOptions) (raster.Page, erro
 	switch {
 	case media.Length > 0 && pageLandscape != sheetLandscape:
 		if o.Orientation == 5 {
-			p = Rotate(p, 3)
+			pl.quarters = 3
 		} else {
-			p = Rotate(p, 1)
+			pl.quarters = 1
 		}
 	case o.Orientation == 6:
-		p = Rotate(p, 2)
+		pl.quarters = 2
+	}
+	w, h, xdpi, ydpi := p.Width, p.Height, p.XDPI, p.YDPI
+	if pl.quarters%2 == 1 {
+		w, h, xdpi, ydpi = h, w, ydpi, xdpi
 	}
 
-	srcW := float64(p.Width) / float64(p.XDPI) * 2540 // hundredths of a millimetre
-	srcH := float64(p.Height) / float64(p.YDPI) * 2540
+	srcW := float64(w) / float64(xdpi) * 2540 // hundredths of a millimetre
+	srcH := float64(h) / float64(ydpi) * 2540
 	sheetW, sheetH := float64(media.Width), float64(media.Length)
 	m := media.Margins
 	printW, printH := sheetW-float64(m.Left+m.Right), sheetH-float64(m.Top+m.Bottom)
@@ -88,15 +202,15 @@ func Place(p raster.Page, media driver.Media, o PlaceOptions) (raster.Page, erro
 			scale = sheetW / srcW
 		}
 	default:
-		return raster.Page{}, fmt.Errorf("imaging: print-scaling %q", o.Scaling)
+		return pl, fmt.Errorf("imaging: print-scaling %q", o.Scaling)
 	}
 
-	outW, outH := SheetDots(media, o.XDPI, o.YDPI)
+	pl.outW, pl.outH = SheetDots(media, o.XDPI, o.YDPI)
 	placedW := srcW * scale
 	placedH := srcH * scale
 	var offX, offY float64 // where the page's top-left lands, hundredths of a millimetre
 	if media.Length == 0 {
-		outH = max(dots(placedH, o.YDPI), 1)
+		pl.outH = max(dots(placedH, o.YDPI), 1)
 	}
 	if mode == "fit" || (mode == "auto-fit" && scale != 1) {
 		offX = float64(m.Left) + (printW-placedW)/2
@@ -109,32 +223,19 @@ func Place(p raster.Page, media driver.Media, o PlaceOptions) (raster.Page, erro
 		offY = 0
 	}
 
-	ox, oy := int(math.Round(offX*float64(o.XDPI)/2540)), int(math.Round(offY*float64(o.YDPI)/2540))
-	pw, ph := int(math.Round(placedW*float64(o.XDPI)/2540)), int(math.Round(placedH*float64(o.YDPI)/2540))
-	if scale == 1 && p.XDPI == o.XDPI && p.YDPI == o.YDPI {
-		pw, ph = p.Width, p.Height
+	pl.ox, pl.oy = int(math.Round(offX*float64(o.XDPI)/2540)), int(math.Round(offY*float64(o.YDPI)/2540))
+	pl.pw, pl.ph = int(math.Round(placedW*float64(o.XDPI)/2540)), int(math.Round(placedH*float64(o.YDPI)/2540))
+	if scale == 1 && xdpi == o.XDPI && ydpi == o.YDPI {
+		pl.pw, pl.ph = w, h
 	}
-	if pw > 0 && ph > 0 && (pw != p.Width || ph != p.Height) {
+	if pl.pw > 0 && pl.ph > 0 && (pl.pw != w || pl.ph != h) {
 		// resample's buffers are transient, so they are checked but not charged; a page
 		// placed at "none" or "fill" may be far larger than the sheet it is cropped to.
-		if err := o.Budget.Check(int64(pw) * int64(max(ph, p.Height))); err != nil {
-			return raster.Page{}, err
+		if err := o.Budget.Check(int64(pl.pw) * int64(max(pl.ph, h))); err != nil {
+			return pl, err
 		}
 	}
-	if err := o.Budget.Charge(int64(outW) * int64(outH)); err != nil {
-		return raster.Page{}, err
-	}
-	out := raster.Page{Width: outW, Height: outH, XDPI: o.XDPI, YDPI: o.YDPI, Gray: make([]byte, outW*outH)}
-	for i := range out.Gray {
-		out.Gray[i] = 255
-	}
-	if pw > 0 && ph > 0 {
-		blit(&out, resample(p, pw, ph), ox, oy)
-	}
-	if !o.KeepMargins {
-		clearMargins(&out, m, media.Length == 0)
-	}
-	return out, nil
+	return pl, nil
 }
 
 // SheetDots is the size of the sheet Place returns for media at xdpi by ydpi. A roll's height

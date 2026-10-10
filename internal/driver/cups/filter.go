@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -120,90 +121,189 @@ type filterRun struct {
 	env       []string
 	timeout   time.Duration
 	maxOutput int64
-	logf      func(format string, args ...any)
-	message   func(string) // job-state-message; nil = none
+	// grace is how long the filter may still run after the job is cancelled, once part of its
+	// output reached the printer.
+	grace   time.Duration
+	logf    func(format string, args ...any)
+	message func(string) // job-state-message; nil = none
 }
 
 var errOutputCap = errors.New("output cap reached")
 
-// run executes the filter directly (no shell) with stdin as its input and returns its output.
-func (f filterRun) run(parent context.Context, stdin io.Reader) ([]byte, error) {
+// cancelGrace bounds how long a cancelled job's filter may take to finish the pages it has: a
+// gs-based filter on a small board can need tens of seconds for a 600 dpi page.
+const cancelGrace = time.Minute
+
+// run executes the filter directly (no shell) with stdin as its input and copies its output to
+// stdout as it comes. The filter is killed when it makes no progress (reads no input, writes no
+// output) for the timeout, when the output passes maxOutput bytes, or when stdout fails. When
+// parent is cancelled, stdin is expected to end; a filter that has already sent output then gets
+// the grace period to end its device job, and one that has not is killed at once. It returns the
+// number of bytes written to stdout.
+func (f filterRun) run(parent context.Context, stdin io.Reader, stdout io.Writer) (int64, error) {
 	name := filepath.Base(f.path)
-	ctx, cancel := context.WithTimeout(parent, f.timeout)
+	// Killing the filter as soon as the job is cancelled would cut the printer off mid-page,
+	// with no job ending, and the next job's first bytes would be read as this one's data.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	defer cancel()
+	act := &activity{}
+	act.touch()
+	in := &activeReader{r: stdin, act: act}
+	out := &outWriter{w: stdout, max: f.maxOutput, cancel: cancel, act: act}
 	cmd := exec.CommandContext(ctx, f.path)
 	cmd.Args = append([]string{printerName}, f.args...)
 	cmd.Env = f.env
-	cmd.Stdin = stdin
-	out := &capWriter{max: f.maxOutput, cancel: cancel}
+	cmd.Stdin = in
 	cmd.Stdout = out
 	log := &stderrLog{logf: f.logf, message: f.message, name: name}
 	cmd.Stderr = log
 	cmd.WaitDelay = 5 * time.Second
 	ownProcessGroup(cmd)
 	start := time.Now()
+	var timedOut, gaveUp atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+			return
+		case <-parent.Done():
+		}
+		if out.stopIfEmpty(parent.Err()) {
+			cancel()
+			return
+		}
+		t := time.NewTimer(f.grace)
+		defer t.Stop()
+		select {
+		case <-done:
+		case <-t.C:
+			gaveUp.Store(true)
+			cancel()
+		}
+	}()
+	go func() {
+		t := time.NewTicker(min(f.timeout/4, time.Second))
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if act.idle() > f.timeout {
+					timedOut.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	err := cmd.Run()
+	close(done)
+	killGroup(cmd)
 	log.flush()
+	n, werr, over := out.result()
 	switch {
-	case out.over():
-		return nil, fmt.Errorf("filter %s: output exceeds %d bytes (raise --driver-opt max-output)", name, f.maxOutput)
+	case over:
+		return n, fmt.Errorf("filter %s: output exceeds %d bytes (raise --driver-opt max-output)", name, f.maxOutput)
+	case werr != nil:
+		return n, werr
+	case gaveUp.Load():
+		err := fmt.Errorf("filter %s: killed %v after the job was cancelled; the printer may not have got the end of the job: %w", name, f.grace, parent.Err())
+		if f.logf != nil {
+			f.logf("%v", err)
+		}
+		return n, err
 	case parent.Err() != nil:
-		return nil, parent.Err()
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return nil, fmt.Errorf("filter %s: timed out after %v%s", name, f.timeout, log.summary())
+		return n, parent.Err()
+	case timedOut.Load():
+		return n, fmt.Errorf("filter %s: timed out after %v without progress%s", name, f.timeout, log.summary())
 	case err != nil:
-		return nil, fmt.Errorf("filter %s failed: %w%s", name, err, log.summary())
-	}
-	data := out.bytes()
-	if len(data) == 0 {
-		return nil, fmt.Errorf("filter %s produced no output%s", name, log.summary())
+		return n, fmt.Errorf("filter %s failed: %w%s", name, err, log.summary())
+	case n == 0:
+		return 0, fmt.Errorf("filter %s produced no output%s", name, log.summary())
 	}
 	if f.logf != nil {
-		f.logf("filter %s: %d bytes in %v", name, len(data), time.Since(start).Round(time.Millisecond))
+		f.logf("filter %s: %d bytes in %v", name, n, time.Since(start).Round(time.Millisecond))
 	}
-	return data, nil
+	return n, nil
 }
 
-// capWriter keeps the filter's output and stops the filter once it passes max bytes.
-type capWriter struct {
+// activity is when the filter last read input or wrote output.
+type activity struct{ last atomic.Int64 }
+
+func (a *activity) touch()              { a.last.Store(time.Now().UnixNano()) }
+func (a *activity) idle() time.Duration { return time.Duration(time.Now().UnixNano() - a.last.Load()) }
+
+type activeReader struct {
+	r   io.Reader
+	act *activity
+}
+
+func (r *activeReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.act.touch()
+	}
+	return n, err
+}
+
+// outWriter passes the filter's output on, and stops the filter once it passes max bytes or the
+// destination fails: a filter whose output is no longer read would block until the timeout.
+type outWriter struct {
 	mu     sync.Mutex
-	buf    []byte
+	w      io.Writer
+	n      int64
 	max    int64
 	isOver bool
+	err    error
 	cancel context.CancelFunc
+	act    *activity
 }
 
-func (w *capWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	need := int64(len(w.buf)) + int64(len(p))
-	if need > w.max {
-		w.isOver = true
-		w.cancel()
-		return 0, errOutputCap
+func (o *outWriter) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.err != nil {
+		return 0, o.err
 	}
-	if need > int64(cap(w.buf)) {
-		// Grow by doubling like bytes.Buffer, but never past max: a buffer doubled beyond
-		// the cap could need twice max-output.
-		n := min(max(2*int64(cap(w.buf)), need, 64<<10), w.max)
-		buf := make([]byte, len(w.buf), n)
-		copy(buf, w.buf)
-		w.buf = buf
+	if o.n+int64(len(p)) > o.max {
+		o.isOver = true
+		o.err = errOutputCap
+		o.cancel()
+		return 0, o.err
 	}
-	w.buf = append(w.buf, p...)
-	return len(p), nil
+	n, err := o.w.Write(p)
+	o.n += int64(n)
+	o.act.touch()
+	if err != nil {
+		o.err = err
+		o.cancel()
+	}
+	return n, err
 }
 
-func (w *capWriter) over() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.isOver
+// stopIfEmpty makes every later write fail with err if nothing was passed on yet, and reports
+// whether it did.
+func (o *outWriter) stopIfEmpty(err error) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.n > 0 {
+		return false
+	}
+	if o.err == nil {
+		o.err = err
+	}
+	return true
 }
 
-func (w *capWriter) bytes() []byte {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf
+// result is the bytes passed on, the destination's error and whether the cap was passed.
+func (o *outWriter) result() (int64, error, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.isOver {
+		return o.n, nil, true
+	}
+	return o.n, o.err, false
 }
 
 const (

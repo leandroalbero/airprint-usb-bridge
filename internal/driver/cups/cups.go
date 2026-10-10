@@ -22,12 +22,11 @@ import (
 	"github.com/leandroalbero/airprint-usb-bridge/internal/raster"
 )
 
-// Option defaults, also shown by register.go. The whole filter output is held in memory, briefly
-// up to about twice max-output while the buffer grows, so max-output must stay well under the
-// systemd unit's MemoryMax next to the job's document and decoded pages.
+// Option defaults, also shown by register.go. The filter's output streams to the printer, so
+// max-output only stops a runaway filter; it is not held in memory.
 const (
 	defaultTimeout   = 5 * time.Minute
-	defaultMaxOutput = "96M"
+	defaultMaxOutput = "16G"
 	defaultDeviceURI = "file:///dev/null"
 )
 
@@ -508,8 +507,8 @@ func (d *Driver) capabilities(cfg driver.Config, label bool, def int) driver.Cap
 
 	var res []driver.Resolution
 	var dpis []int
-	// Clients send pages at the first advertised resolution, and the bridge decodes whole jobs
-	// under a memory cap, so the lowest resolution of at least 300 dpi goes first. A job that
+	// Clients send pages at the first advertised resolution, and every page is decoded and
+	// converted at it, so the lowest resolution of at least 300 dpi goes first. A job that
 	// names no resolution still prints at the PPD default.
 	first := 0
 	for i, r := range d.res {
@@ -699,48 +698,107 @@ func (d *Driver) resolutionFor(job driver.JobInfo) resChoice {
 	return d.res[0]
 }
 
-// Render writes the pages as CUPS raster and runs the filter over them. The filter's output is
-// one unit: the printer bytes for the whole job.
+// Render is the job rendered in memory; the bridge streams it instead (Stream).
 func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.Page) ([]driver.Unit, error) {
-	if len(pages) == 0 {
+	return driver.RenderStream(ctx, d, job, pages)
+}
+
+// jobPlan is the page setup of one job.
+type jobPlan struct {
+	size  pageSize
+	r     resChoice
+	sides string
+	h     Header
+	f     format
+	// fitted is the resolution asked for when it was too large for the size.
+	fitted *resChoice
+}
+
+func (d *Driver) plan(job driver.JobInfo) (jobPlan, error) {
+	pl := jobPlan{size: d.sizeFor(job.Media), r: d.resolutionFor(job), sides: job.Sides}
+	if !d.duplex {
+		pl.sides = "one-sided"
+	}
+	if fit := d.fittingResolution(pl.size, pl.r, pl.sides); fit != pl.r {
+		asked := pl.r
+		pl.fitted, pl.r = &asked, fit
+	}
+	var err error
+	pl.h, pl.f, err = d.header(pl.size, pl.r, pl.sides)
+	return pl, err
+}
+
+func (d *Driver) placeOptions(job driver.JobInfo, h Header) imaging.PlaceOptions {
+	return imaging.PlaceOptions{
+		XDPI: int(h.HWResolution[0]), YDPI: int(h.HWResolution[1]),
+		Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget,
+	}
+}
+
+// CheckPage checks that page n is well formed and can be placed on the job's sheet.
+func (d *Driver) CheckPage(job driver.JobInfo, n int, p raster.Page) error {
+	if p.Width <= 0 || p.Height <= 0 || (p.Gray != nil && len(p.Gray) != p.Width*p.Height) || p.XDPI <= 0 || p.YDPI <= 0 {
+		return driver.DocumentErrorf("page %d: malformed %dx%d page at %dx%d dpi", n, p.Width, p.Height, p.XDPI, p.YDPI)
+	}
+	pl, err := d.plan(job)
+	if err != nil {
+		return nil // Plan refuses the job
+	}
+	if err := imaging.CheckPlace(p, pl.size.sheet(), d.placeOptions(job, pl.h)); err != nil {
+		return driver.DocumentError(fmt.Errorf("page %d: %w", n, err))
+	}
+	return nil
+}
+
+// Plan makes one unit of the whole job: the filter's output for every page.
+func (d *Driver) Plan(job driver.JobInfo, pages int) ([]driver.Unit, error) {
+	if pages == 0 {
 		return nil, driver.DocumentErrorf("no pages")
 	}
-	for i, p := range pages {
-		if p.Width <= 0 || p.Height <= 0 || len(p.Gray) != p.Width*p.Height || p.XDPI <= 0 || p.YDPI <= 0 {
-			return nil, driver.DocumentErrorf("page %d: malformed %dx%d page at %dx%d dpi", i+1, p.Width, p.Height, p.XDPI, p.YDPI)
-		}
+	pl, err := d.plan(job)
+	if pl.fitted != nil {
+		job.Log("cups: %s is too large at %dx%d dpi; using %dx%d dpi", pl.size.choice, pl.fitted.res.X, pl.fitted.res.Y, pl.r.res.X, pl.r.res.Y)
 	}
-	size := d.sizeFor(job.Media)
-	r := d.resolutionFor(job)
-	sides := job.Sides
-	if !d.duplex {
-		sides = "one-sided"
-	}
-	if fit := d.fittingResolution(size, r, sides); fit != r {
-		job.Log("cups: %s is too large at %dx%d dpi; using %dx%d dpi", size.choice, r.res.X, r.res.Y, fit.res.X, fit.res.Y)
-		r = fit
-	}
-	h, f, err := d.header(size, r, sides)
 	if err != nil {
 		return nil, err
 	}
+	h := pl.h
 	job.Log("cups: %s at %dx%d dpi, %d pages, %d-bit colour space %d, %dx%d pixels",
-		size.choice, r.res.X, r.res.Y, len(pages), h.CupsBitsPerColor, h.CupsColorSpace, h.CupsWidth, h.CupsHeight)
+		pl.size.choice, pl.r.res.X, pl.r.res.Y, pages, h.CupsBitsPerColor, h.CupsColorSpace, h.CupsWidth, h.CupsHeight)
+	label := fmt.Sprintf("%s job (%d pages)", d.filterName(), pages)
+	if pages == 1 {
+		label = d.filterName() + " job (1 page)"
+	}
+	return []driver.Unit{{Label: label, Impressions: pages, Meta: pl}}, nil
+}
 
-	stream := &rasterStream{ctx: ctx, n: len(pages), next: func(i int) ([]byte, error) {
-		return d.page(job, pages, i, size, h, f)
-	}}
-	var data []byte
-	if d.filter == "" {
-		data, err = io.ReadAll(io.LimitReader(stream, d.maxOut+1))
+// Stream writes the pages as CUPS raster, converting each when the filter reads that far, and
+// passes the filter's output on as it comes. When a page fails or the job is cancelled, the
+// filter's input ends there, so the filter can still finish the device job for the pages before it.
+func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, pages driver.PageReader, w io.Writer) error {
+	pl, ok := u.Meta.(jobPlan)
+	if !ok {
+		return fmt.Errorf("cups: unit %q was not planned by this driver", u.Label)
+	}
+	out := driver.NewOutput(ctx, w)
+	var buf []byte
+	stream := &rasterStream{ctx: ctx, next: func(n int) ([]byte, error) {
+		p, err := pages.Next()
 		if err != nil {
 			return nil, err
 		}
-		if int64(len(data)) > d.maxOut {
-			return nil, fmt.Errorf("raster exceeds %d bytes (raise --driver-opt max-output)", d.maxOut)
+		buf, err = d.page(job, p, n, pl, buf[:0])
+		return buf, err
+	}}
+	var err error
+	if d.filter == "" {
+		cw := &outWriter{w: out, max: d.maxOut, cancel: func() {}, act: &activity{}}
+		_, err = io.Copy(cw, stream)
+		if _, _, over := cw.result(); over {
+			err = fmt.Errorf("raster exceeds %d bytes (raise --driver-opt max-output)", d.maxOut)
 		}
 	} else {
-		sel := d.choices(size, r, sides)
+		sel := d.choices(pl.size, pl.r, pl.sides)
 		keys := make([]string, 0, len(sel))
 		for k := range sel {
 			keys = append(keys, k)
@@ -755,22 +813,19 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 			env:       filterEnv(d.ppdPath, d.final, d.uri, d.filter),
 			timeout:   d.timeout,
 			maxOutput: d.maxOut,
+			grace:     cancelGrace,
 			logf:      job.Logf,
 			message:   job.StateMessage,
 		}
-		data, err = run.run(ctx, stream)
+		_, err = run.run(ctx, stream, out)
 		if serr := stream.failure(); serr != nil {
-			return nil, serr
-		}
-		if err != nil {
-			return nil, err
+			err = serr
 		}
 	}
-	label := fmt.Sprintf("%s job (%d pages)", d.filterName(), len(pages))
-	if len(pages) == 1 {
-		label = d.filterName() + " job (1 page)"
+	if err != nil {
+		return out.Abort(err, nil)
 	}
-	return []driver.Unit{{Data: data, Label: label, Impressions: len(pages)}}, nil
+	return nil
 }
 
 // sheet is the media Place lays pages on: the exact paper size, not the advertised one.
@@ -780,30 +835,31 @@ func (z pageSize) sheet() driver.Media {
 	return m
 }
 
-// page converts page i to its raster header and data.
-func (d *Driver) page(job driver.JobInfo, pages []raster.Page, i int, size pageSize, h Header, f format) ([]byte, error) {
+// page converts page n (from 1) to its raster header and data, appended to dst.
+func (d *Driver) page(job driver.JobInfo, pg raster.Page, n int, pl jobPlan, dst []byte) ([]byte, error) {
+	h, f, size := pl.h, pl.f, pl.size
 	xres, yres := int(h.HWResolution[0]), int(h.HWResolution[1])
-	sheet, err := imaging.Place(pages[i], size.sheet(), imaging.PlaceOptions{
-		XDPI: xres, YDPI: yres, Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget,
-	})
+	o := d.placeOptions(job, h)
+	o.InPlace = true
+	sheet, err := imaging.Place(pg, size.sheet(), o)
 	if err != nil {
-		return nil, driver.DocumentError(fmt.Errorf("page %d: %w", i+1, err))
+		return nil, driver.DocumentError(fmt.Errorf("page %d: %w", n, err))
 	}
-	pages[i].Gray = nil
+	defer job.Budget.Release(int64(sheet.Width) * int64(sheet.Height))
 	area := size.area
 	if d.fullPage {
 		area = [4]float64{0, 0, size.width, size.length}
 	}
 	x0 := int(math.Round(area[0] * float64(xres) / 72))
 	y0 := int(math.Round((size.length - area[3]) * float64(yres) / 72))
-	if h.Duplex && i%2 == 1 {
+	if h.Duplex && n%2 == 0 {
 		// The printer applies the front's margins to the back in its own frame, so the
 		// whole sheet is flipped before cropping: with unequal margins, flipping the cropped
 		// area instead shifts the back page by their difference.
 		fx, fy := backSideFlip(d.backSide, h.Tumble)
 		flip(sheet, fx, fy)
 	}
-	p := crop(sheet, x0, y0, int(h.CupsWidth), int(h.CupsHeight))
+	p := cropInPlace(sheet, x0, y0, int(h.CupsWidth), int(h.CupsHeight))
 	var bm *imaging.Bitmap
 	if h.CupsBitsPerColor == 1 {
 		var dithered bool
@@ -811,15 +867,21 @@ func (d *Driver) page(job driver.JobInfo, pages []raster.Page, i int, size pageS
 		if err != nil {
 			return nil, err
 		}
-		job.Log("page %d: %dx%d pixels, dithered %v", i+1, p.Width, p.Height, dithered)
-		job.DebugImage(fmt.Sprintf("p%d", i+1), bm.Image())
+		job.Log("page %d: %dx%d pixels, dithered %v", n, p.Width, p.Height, dithered)
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d", n), bm.Image())
+		}
 	} else {
-		job.Log("page %d: %dx%d pixels", i+1, p.Width, p.Height)
-		job.DebugImage(fmt.Sprintf("p%d", i+1), imaging.GrayImage(p))
+		job.Log("page %d: %dx%d pixels", n, p.Width, p.Height)
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d", n), imaging.GrayImage(p))
+		}
 	}
-	out := make([]byte, 0, HeaderSize+int(h.CupsBytesPerLine)*f.rows)
-	out = append(out, h.Marshal(byteOrder)...)
-	return encodePage(out, &h, f, p, bm), nil
+	if need := HeaderSize + int(h.CupsBytesPerLine)*f.rows; cap(dst) < need {
+		dst = make([]byte, 0, need)
+	}
+	dst = append(dst, h.Marshal(byteOrder)...)
+	return encodePage(dst, &h, f, p, bm), nil
 }
 
 // backSideFlip is how a duplex back page is pre-transformed for a PPD's *cupsBackSide, so the
@@ -837,14 +899,13 @@ func backSideFlip(backSide string, tumble bool) (x, y bool) {
 }
 
 // rasterStream is the filter's stdin: the sync word, then each page converted when the filter
-// reads that far, so only one page of raster is held in memory.
+// reads that far, so only one page of raster is held in memory. next gets the page number.
 type rasterStream struct {
 	ctx  context.Context
-	n    int
-	next func(i int) ([]byte, error)
+	next func(n int) ([]byte, error)
 
 	mu      sync.Mutex
-	i       int
+	n       int
 	started bool
 	buf     []byte
 	err     error
@@ -855,6 +916,9 @@ func (r *rasterStream) Read(p []byte) (int, error) {
 	defer r.mu.Unlock()
 	for len(r.buf) == 0 {
 		if r.err != nil {
+			if r.err == io.EOF {
+				return 0, io.EOF
+			}
 			return 0, r.err
 		}
 		if !r.started {
@@ -862,18 +926,15 @@ func (r *rasterStream) Read(p []byte) (int, error) {
 			r.buf = syncV3()
 			break
 		}
-		if r.i >= r.n {
-			return 0, io.EOF
-		}
 		if err := r.ctx.Err(); err != nil {
 			r.err = err
 			return 0, err
 		}
-		b, err := r.next(r.i)
-		r.i++
+		r.n++
+		b, err := r.next(r.n)
 		if err != nil {
 			r.err = err
-			return 0, err
+			continue
 		}
 		r.buf = b
 	}
@@ -886,6 +947,9 @@ func (r *rasterStream) Read(p []byte) (int, error) {
 func (r *rasterStream) failure() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.err == io.EOF {
+		return nil
+	}
 	return r.err
 }
 

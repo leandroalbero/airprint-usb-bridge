@@ -5,8 +5,10 @@
 // See docs/specs/DRIVER-API.md (local) for the contract; the short version:
 //   - Render converts and validates every page before returning, so a bad page never leaves a
 //     half-printed job.
-//   - Optional interfaces add behaviour: PageLimiter, DocumentRenderer, ImageRenderer,
-//     Inspector and SenderProvider.
+//   - A document driver also implements Streamer: the bridge checks every page first, then
+//     streams the job to the printer page by page, so its length is not bounded by memory.
+//   - Optional interfaces add behaviour: Streamer, DocumentStreamer, PageLimiter,
+//     DocumentRenderer, ImageRenderer, Inspector and SenderProvider.
 //   - Drivers register themselves from init with Register.
 package driver
 

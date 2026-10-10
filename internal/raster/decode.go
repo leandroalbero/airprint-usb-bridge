@@ -4,9 +4,9 @@ package raster
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 )
 
 var (
@@ -45,9 +45,11 @@ func Decode(data []byte) ([]Page, error) {
 	return decode(data, Limits{})
 }
 
-// Limits tightens DecodeLimited. Zero fields keep Decode's caps and skip the checks.
+// Limits tightens DecodeLimited and Reader. Zero fields keep Decode's caps and skip the checks.
 type Limits struct {
-	MaxGrayBytes int // decoded gray over all pages; <= 0 means MaxGrayBytes
+	// MaxGrayBytes is the decoded gray over all pages for DecodeLimited, and per page for a
+	// Reader; <= 0 means MaxGrayBytes.
+	MaxGrayBytes int
 	// WidthMin and WidthMax are the page widths Prepare accepts, in dots at
 	// 300 dpi. When set, every page header must also say 300 or 600 dpi.
 	WidthMin, WidthMax int
@@ -82,88 +84,29 @@ func (lim Limits) check(h pageHeader, n int) error {
 	return nil
 }
 
-func decode(data []byte, lim Limits) ([]Page, error) {
-	maxGray := lim.MaxGrayBytes
-	if maxGray <= 0 || maxGray > MaxGrayBytes {
-		maxGray = MaxGrayBytes
-	}
-	var pages []Page
-	total := 0
-	add := func(h pageHeader, pos int) (int, error) {
-		if lim.MaxPages > 0 && len(pages) >= lim.MaxPages {
-			return 0, fmt.Errorf("%w: more than %d pages", ErrTooLarge, lim.MaxPages)
-		}
-		if err := checkHeader(h, len(pages)+1); err != nil {
-			return 0, err
-		}
-		if err := lim.check(h, len(pages)+1); err != nil {
-			return 0, err
-		}
-		if h.height > (maxGray-total)/h.width {
-			return 0, fmt.Errorf("%w: page %d needs %d bytes of gray, over the %d byte budget", ErrTooLarge, len(pages)+1, h.width*h.height, maxGray)
-		}
-		p, next, err := decodePage(data, pos, h)
-		if err != nil {
-			return 0, fmt.Errorf("page %d: %w", len(pages)+1, err)
-		}
-		total += h.width * h.height
-		pages = append(pages, p)
-		return next, nil
-	}
+// DecodeFrom is DecodeLimited reading the document from r, so it is never held in memory next
+// to its decoded pages.
+func DecodeFrom(r io.Reader, lim Limits) ([]Page, error) {
+	return decodeFrom(r, lim)
+}
 
-	switch {
-	case bytes.HasPrefix(data, []byte(urfMagic)):
-		if len(data) < 12 {
-			return nil, ErrTruncated
+func decode(data []byte, lim Limits) ([]Page, error) {
+	return decodeFrom(bytes.NewReader(data), lim)
+}
+
+func decodeFrom(src io.Reader, lim Limits) ([]Page, error) {
+	r := newReader(src, lim, true)
+	var pages []Page
+	for {
+		p, err := r.Next()
+		if err == io.EOF {
+			return pages, nil
 		}
-		count := binary.BigEndian.Uint32(data[8:12])
-		pos := 12
-		for pos+urfHeaderLen <= len(data) && (count == 0 || uint32(len(pages)) < count) {
-			h := data[pos : pos+urfHeaderLen]
-			dpi := int(binary.BigEndian.Uint32(h[20:24]))
-			ph := pageHeader{
-				bpp:         int(h[0]),
-				width:       int(binary.BigEndian.Uint32(h[12:16])),
-				height:      int(binary.BigEndian.Uint32(h[16:20])),
-				xdpi:        dpi,
-				ydpi:        dpi,
-				subtractive: h[1] == 6,
-			}
-			next, err := add(ph, pos+urfHeaderLen)
-			if err != nil {
-				return nil, err
-			}
-			pos = next
+		if err != nil {
+			return nil, err
 		}
-		if count != 0 && uint32(len(pages)) < count {
-			return nil, fmt.Errorf("%w: header announces %d pages, found %d", ErrTruncated, count, len(pages))
-		}
-	case bytes.HasPrefix(data, []byte(pwgMagic)):
-		pos := 4
-		for pos+pwgHeaderLen <= len(data) {
-			h := data[pos : pos+pwgHeaderLen]
-			cs := binary.BigEndian.Uint32(h[400:404])
-			ph := pageHeader{
-				bpp:         int(binary.BigEndian.Uint32(h[388:392])),
-				width:       int(binary.BigEndian.Uint32(h[372:376])),
-				height:      int(binary.BigEndian.Uint32(h[376:380])),
-				xdpi:        int(binary.BigEndian.Uint32(h[276:280])),
-				ydpi:        int(binary.BigEndian.Uint32(h[280:284])),
-				subtractive: cs == 3 || cs == 6,
-			}
-			next, err := add(ph, pos+pwgHeaderLen)
-			if err != nil {
-				return nil, err
-			}
-			pos = next
-		}
-	default:
-		return nil, ErrUnsupported
+		pages = append(pages, p)
 	}
-	if len(pages) == 0 {
-		return nil, ErrNoPages
-	}
-	return pages, nil
 }
 
 func checkHeader(h pageHeader, n int) error {
@@ -177,69 +120,6 @@ func checkHeader(h pageHeader, n int) error {
 		return fmt.Errorf("%w: page %d is %dx%d, cap %dx%d", ErrTooLarge, n, h.width, h.height, MaxWidth, MaxHeight)
 	}
 	return nil
-}
-
-func decodePage(data []byte, pos int, h pageHeader) (Page, int, error) {
-	bypp := h.bpp / 8
-	need := h.width * bypp
-	raw := make([]byte, need)
-	row := make([]byte, h.width)
-	var fill byte = 0xff
-	if h.subtractive {
-		fill = 0x00
-	}
-	size := h.width * h.height
-	gray := make([]byte, 0, min(size, 1<<20))
-	for y := 0; y < h.height; {
-		if pos >= len(data) {
-			return Page{}, 0, ErrTruncated
-		}
-		rep := int(data[pos]) + 1
-		pos++
-		n := 0
-		for n < need {
-			if pos >= len(data) {
-				return Page{}, 0, ErrTruncated
-			}
-			b := data[pos]
-			pos++
-			switch {
-			case b == 128:
-				for ; n < need; n++ {
-					raw[n] = fill
-				}
-			case b > 128:
-				// Runs may overshoot the line; the excess is consumed and dropped.
-				k := (257 - int(b)) * bypp
-				if pos+k > len(data) {
-					return Page{}, 0, ErrTruncated
-				}
-				n += copy(raw[n:], data[pos:pos+k])
-				pos += k
-			default:
-				if pos+bypp > len(data) {
-					return Page{}, 0, ErrTruncated
-				}
-				px := data[pos : pos+bypp]
-				pos += bypp
-				for i := 0; i <= int(b) && n < need; i++ {
-					n += copy(raw[n:], px)
-				}
-			}
-		}
-		toGray(row, raw, bypp, h.subtractive)
-		rep = min(rep, h.height-y)
-		if len(gray)+rep*h.width > cap(gray) {
-			grown := make([]byte, len(gray), min(size, max(2*cap(gray), len(gray)+rep*h.width)))
-			copy(grown, gray)
-			gray = grown
-		}
-		for i := 0; i < rep; i++ {
-			gray = append(gray, row...)
-		}
-		y += rep
-	}
-	return Page{Width: h.width, Height: h.height, XDPI: h.xdpi, YDPI: h.ydpi, Gray: gray}, pos, nil
 }
 
 // toGray averages the first three channels only, so the K of CMYK and the

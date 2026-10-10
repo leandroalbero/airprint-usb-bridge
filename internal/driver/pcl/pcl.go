@@ -5,6 +5,7 @@ package pcl
 import (
 	"context"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -217,16 +218,62 @@ func (d *Driver) resolution(job driver.JobInfo) int {
 	return d.dpis[0]
 }
 
-// Render places, binarizes and encodes every page, then wraps them in one PJL job. Each copy is
-// that job sent again: copies stay collated and start on a new sheet, and all of them share one
-// buffer instead of holding the job copies times over.
+// Render is the job rendered in memory; the bridge streams it instead (Stream).
 func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.Page) ([]driver.Unit, error) {
-	if len(pages) == 0 {
+	return driver.RenderStream(ctx, d, job, pages)
+}
+
+func (d *Driver) placeOptions(job driver.JobInfo, dpi int) imaging.PlaceOptions {
+	return imaging.PlaceOptions{XDPI: dpi, YDPI: dpi, Orientation: job.Orientation, Scaling: job.Scaling, Budget: job.Budget}
+}
+
+// CheckPage checks that page n can be placed on the job's sheet.
+func (d *Driver) CheckPage(job driver.JobInfo, n int, pg raster.Page) error {
+	if err := imaging.CheckPlace(pg, job.Media, d.placeOptions(job, d.resolution(job))); err != nil {
+		return driver.DocumentError(fmt.Errorf("pcl: page %d: %w", n, err))
+	}
+	return nil
+}
+
+// Plan makes one PJL job of every page. Each copy is that job sent again: copies stay collated
+// and start on a new sheet.
+func (d *Driver) Plan(job driver.JobInfo, pages int) ([]driver.Unit, error) {
+	if pages == 0 {
 		return nil, driver.DocumentErrorf("pcl: no pages")
 	}
 	p, ok := paperFor(job.Media.Name)
 	if !ok {
 		return nil, driver.DocumentErrorf("pcl: media %q is not supported (have %s)", job.Media.Name, mediaHelp())
+	}
+	dpi := d.resolution(job)
+	if off, lw := p.logical(dpi); off+lw > dots(job.Media.Width, dpi) {
+		return nil, fmt.Errorf("pcl: logical page %d+%d dots wider than the %d-dot sheet", off, lw, dots(job.Media.Width, dpi))
+	}
+	label := fmt.Sprintf("PCL job, %d page(s)", pages)
+	copies := max(job.Copies, 1)
+	units := make([]driver.Unit, copies)
+	for c := range units {
+		units[c] = driver.Unit{Label: label, Impressions: pages}
+		if copies > 1 {
+			units[c].Label = fmt.Sprintf("%s, copy %d of %d", label, c+1, copies)
+		}
+	}
+	return units, nil
+}
+
+func dots(hmm, dpi int) int {
+	w, _ := imaging.SheetDots(driver.Media{Width: hmm}, dpi, dpi)
+	return w
+}
+
+// Stream places, binarizes and encodes one page at a time inside one PJL job. The prologue goes
+// out with the first page, so a job that fails before it sends nothing; one that fails later
+// still gets the job ending.
+func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, _ driver.Unit, pages driver.PageReader, w io.Writer) error {
+	out := driver.NewOutput(ctx, w)
+	p, ok := paperFor(job.Media.Name)
+	if !ok {
+		return driver.DocumentErrorf("pcl: media %q is not supported (have %s)", job.Media.Name, mediaHelp())
 	}
 	dpi := d.resolution(job)
 	duplex := 0
@@ -238,46 +285,55 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 			duplex = 2
 		}
 	}
-	w := &writer{compression: d.compression}
-	encoded := make([][]byte, len(pages))
-	for i := range pages {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		bm, err := d.page(job, pages[i], p, dpi, i+1)
-		if err != nil {
-			return nil, err
-		}
-		pages[i].Gray = nil
-		encoded[i] = w.page(bm)
-		job.Log("page %d: %s %dx%d dots at %d dpi, %d bytes", i+1, p.alias, bm.W, bm.H, dpi, len(encoded[i]))
-	}
-
-	data := jobBytes(jobHeader{
+	h := jobHeader{
 		name: pjlName(job), pjl: d.pjl, dpi: dpi, code: p.code,
 		duplex: duplex, duplexCapable: d.caps.Duplex,
-	}, slices.Concat(encoded...))
-	label := fmt.Sprintf("PCL job, %d page(s)", len(pages))
-	copies := max(job.Copies, 1)
-	units := make([]driver.Unit, copies)
-	for c := range units {
-		units[c] = driver.Unit{Data: data, Label: label, Impressions: len(pages)}
-		if copies > 1 {
-			units[c].Label = fmt.Sprintf("%s, copy %d of %d", label, c+1, copies)
-		}
 	}
-	return units, nil
+	end := epilogue(h)
+	enc := &writer{compression: d.compression}
+	for n := 1; ; n++ {
+		if err := out.Err(); err != nil {
+			return out.Abort(err, end)
+		}
+		pg, err := pages.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return out.Abort(err, end)
+		}
+		bm, err := d.page(job, pg, p, dpi, n)
+		if err != nil {
+			return out.Abort(err, end)
+		}
+		data := enc.page(bm)
+		if n == 1 {
+			data = append(prologue(h), data...)
+		}
+		if _, err := out.Write(data); err != nil {
+			return out.Abort(err, nil)
+		}
+		job.Log("page %d: %s %dx%d dots at %d dpi, %d bytes", n, p.alias, bm.W, bm.H, dpi, len(enc.out))
+	}
+	if out.Written() == 0 {
+		return driver.DocumentErrorf("pcl: no pages")
+	}
+	if _, err := out.Write(end); err != nil {
+		return out.Abort(err, nil)
+	}
+	return nil
 }
 
 // page returns page n as a bitmap of the logical page: the sheet placed at dpi, binarized and
 // cropped to the logical page's columns.
 func (d *Driver) page(job driver.JobInfo, pg raster.Page, p paper, dpi, n int) (*imaging.Bitmap, error) {
-	sheet, err := imaging.Place(pg, job.Media, imaging.PlaceOptions{
-		XDPI: dpi, YDPI: dpi, Orientation: job.Orientation, Scaling: job.Scaling, Budget: job.Budget,
-	})
+	o := d.placeOptions(job, dpi)
+	o.InPlace = true
+	sheet, err := imaging.Place(pg, job.Media, o)
 	if err != nil {
 		return nil, driver.DocumentError(fmt.Errorf("pcl: page %d: %w", n, err))
 	}
+	defer job.Budget.Release(int64(sheet.Width) * int64(sheet.Height))
 	off, lw := p.logical(dpi)
 	if off+lw > sheet.Width {
 		return nil, fmt.Errorf("pcl: page %d: logical page %d+%d dots wider than the %d-dot sheet", n, off, lw, sheet.Width)
@@ -294,7 +350,9 @@ func (d *Driver) page(job driver.JobInfo, pg raster.Page, p paper, dpi, n int) (
 	if dithered {
 		job.Log("page %d: dithered", n)
 	}
-	job.DebugImage(fmt.Sprintf("p%d", n), bm.Image())
+	if job.Debug != nil {
+		job.DebugImage(fmt.Sprintf("p%d", n), bm.Image())
+	}
 	return bm, nil
 }
 

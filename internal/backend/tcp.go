@@ -43,14 +43,10 @@ func (t *tcpTransport) Send(ctx context.Context, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	port, err := DialTCP(ctx, t.addr, t.dialTimeout, t.stall)
+	p, err := t.dial(ctx)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		return Retryable(err)
+		return err
 	}
-	p := port.(*tcpPort)
 	defer p.Close()
 	wrote := 0
 	for wrote < len(data) {
@@ -70,6 +66,23 @@ func (t *tcpTransport) Send(ctx context.Context, data []byte) error {
 			return fmt.Errorf("%s: %w after %d bytes: %w", t.addr, ErrPartial, wrote, err)
 		}
 	}
+	t.finish(p)
+	return nil
+}
+
+func (t *tcpTransport) dial(ctx context.Context) (*tcpPort, error) {
+	port, err := DialTCP(ctx, t.addr, t.dialTimeout, t.stall)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		return nil, Retryable(err)
+	}
+	return port.(*tcpPort), nil
+}
+
+// finish ends a unit that was sent whole.
+func (t *tcpTransport) finish(p *tcpPort) {
 	// A half-close tells the printer the job is complete; waiting for its close keeps the
 	// final bytes from being reset away by an early close with unread replies pending.
 	if tc, ok := p.conn.(*net.TCPConn); ok {
@@ -77,7 +90,6 @@ func (t *tcpTransport) Send(ctx context.Context, data []byte) error {
 	}
 	_ = p.conn.SetReadDeadline(time.Now().Add(t.linger))
 	_, _ = io.Copy(io.Discard, p.conn)
-	return nil
 }
 
 func (t *tcpTransport) State(ctx context.Context) (State, error) {

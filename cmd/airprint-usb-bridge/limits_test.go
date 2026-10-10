@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,14 +42,16 @@ func TestPrintDocumentRefusesWrongWidthBeforeDecoding(t *testing.T) {
 	for y := 0; y < 26000; y += 256 {
 		data = append(data, 0xff, 0x80)
 	}
-	n, err := p.printDocument(context.Background(), data, p.jobInfo(driver.JobInfo{}, t.Logf, "bomb"), nil)
+	n, err := p.printDocument(context.Background(), docOf(data), p.jobInfo(driver.JobInfo{}, t.Logf, "bomb"), nil)
 	if n != 0 || !errors.Is(err, ipp.ErrDocumentFormat) || !errors.Is(err, raster.ErrWidth) {
 		t.Fatalf("printed %d, err %v", n, err)
 	}
 }
 
 // A small document of tiny low-resolution pages becomes a whole sheet per page at the printer's
-// resolution; the job must be refused once its sheets pass the budget, before anything is sent.
+// resolution; a label driver, which renders the whole job before sending it, must refuse the job
+// once its sheets pass the budget, before anything is sent. Sheet drivers stream instead
+// (TestStreamLongJobBoundedMemory).
 func TestPrintDocumentBoundsRenderedSheets(t *testing.T) {
 	var pages []testutil.Page
 	for i := 0; i < 800; i++ {
@@ -58,7 +62,7 @@ func TestPrintDocumentBoundsRenderedSheets(t *testing.T) {
 		pages = append(pages, testutil.GrayPage(9, 12, 1, g))
 	}
 	data := testutil.EncodeURF(pages...)
-	for _, drv := range []string{"pcl", "postscript", "zpl", "dymo"} {
+	for _, drv := range []string{"zpl", "dymo"} {
 		t.Run(drv, func(t *testing.T) {
 			o := defaultOptions(t)
 			o.driver, o.dryRun = drv, t.TempDir()
@@ -67,7 +71,7 @@ func TestPrintDocumentBoundsRenderedSheets(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer p.send.Close()
-			n, err := p.printDocument(context.Background(), data, p.jobInfo(driver.JobInfo{}, func(string, ...any) {}, "big"), nil)
+			n, err := p.printDocument(context.Background(), docOf(data), p.jobInfo(driver.JobInfo{}, func(string, ...any) {}, "big"), nil)
 			if n != 0 || !errors.Is(err, driver.ErrJobTooLarge) || !errors.Is(err, ipp.ErrDocumentFormat) {
 				t.Fatalf("printed %d, err %v", n, err)
 			}
@@ -91,10 +95,14 @@ func TestPrintDocumentPageCap(t *testing.T) {
 	for i := range pages {
 		pages[i] = page
 	}
-	_, err = p.printDocument(context.Background(), testutil.EncodeURF(pages...), p.jobInfo(driver.JobInfo{}, t.Logf, "many"), nil)
+	_, err = p.printDocument(context.Background(), docOf(testutil.EncodeURF(pages...)), p.jobInfo(driver.JobInfo{}, t.Logf, "many"), nil)
 	if !errors.Is(err, raster.ErrTooLarge) || !errors.Is(err, ipp.ErrDocumentFormat) {
 		t.Fatalf("err %v", err)
 	}
+}
+
+func docOf(data []byte) *io.SectionReader {
+	return io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data)))
 }
 
 func TestDebugOutputIsPrivate(t *testing.T) {
@@ -113,7 +121,7 @@ func TestDebugOutputIsPrivate(t *testing.T) {
 	for i := 732 * 10; i < 732*20; i++ {
 		g[i] = 0
 	}
-	if _, err := p.printDocument(context.Background(), testutil.EncodeURF(testutil.GrayPage(732, 40, 300, g)), p.jobInfo(driver.JobInfo{}, t.Logf, "job1"), nil); err != nil {
+	if _, err := p.printDocument(context.Background(), docOf(testutil.EncodeURF(testutil.GrayPage(732, 40, 300, g))), p.jobInfo(driver.JobInfo{}, t.Logf, "job1"), nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, dir := range []string{o.dryRun, o.debugDir} {

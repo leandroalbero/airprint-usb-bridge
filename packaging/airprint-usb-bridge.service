@@ -12,11 +12,11 @@ RestartSec=5s
 # A stop lets the label being printed finish; with the printer cooling down that
 # can take up to the 15 min the service itself allows.
 TimeoutStopSec=16min
-# Caps a hostile or broken job; the service keeps a 64 MiB document and up to
-# 128 MiB of decoded raster per job. It renders at most 128 MiB of sheets per job,
-# which bounds the printer data, and the cups driver keeps at most max-output
-# (96M by default) of filter output. GOMEMLIMIT makes the Go GC work harder
-# before the hard limit is reached.
+# Caps a hostile or broken job. A label job keeps up to 128 MiB of decoded raster
+# and renders at most 128 MiB of sheets, which bounds its printer data. A sheet
+# printer job streams: it holds about two pages (at most 128 MiB each) whatever
+# its length, and its document (up to 512 MiB) stays in the spool. GOMEMLIMIT
+# makes the Go GC work harder before the hard limit is reached.
 MemoryMax=512M
 Environment=GOMEMLIMIT=384MiB
 

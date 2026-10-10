@@ -167,6 +167,18 @@ func crop(p raster.Page, x0, y0, w, h int) raster.Page {
 	return out
 }
 
+// cropInPlace is crop reusing p's pixels when the window lies inside p; p is then spent.
+func cropInPlace(p raster.Page, x0, y0, w, h int) raster.Page {
+	if x0 < 0 || y0 < 0 || x0+w > p.Width || y0+h > p.Height {
+		return crop(p, x0, y0, w, h)
+	}
+	// Each row moves to an earlier or equal index, and never over a row still to be moved.
+	for y := 0; y < h; y++ {
+		copy(p.Gray[y*w:(y+1)*w], p.Gray[(y0+y)*p.Width+x0:(y0+y)*p.Width+x0+w])
+	}
+	return raster.Page{Width: w, Height: h, XDPI: p.XDPI, YDPI: p.YDPI, Gray: p.Gray[:w*h]}
+}
+
 // flip mirrors p in place across the vertical axis (x), the horizontal axis (y), or both (a
 // half turn), as CUPS drivers with *cupsBackSide expect of duplex back pages.
 func flip(p raster.Page, x, y bool) {

@@ -1,10 +1,10 @@
 package postscript
 
 import (
-	"bytes"
 	"compress/zlib"
 	"encoding/ascii85"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -47,14 +47,37 @@ type pageImage struct {
 	Data       []byte
 }
 
-// docWriter appends a DSC-conforming LanguageLevel 2/3 document to a buffer, page by page, so a
-// job never holds more than one placed sheet at a time.
+// docWriter writes a DSC-conforming LanguageLevel 2/3 document page by page, so a job never
+// holds more than one placed sheet at a time.
 type docWriter struct {
-	buf   *bytes.Buffer
+	buf   *errWriter
 	set   settings
 	doc   docInfo
 	pages int
 	n     int
+}
+
+// errWriter keeps the first write error, so the document can be written without checking every
+// line; page and finish report it.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	n, err := e.w.Write(p)
+	e.err = err
+	return n, err
+}
+
+func (e *errWriter) WriteString(s string) { _, _ = io.WriteString(e, s) }
+
+func (e *errWriter) WriteByte(c byte) error {
+	_, err := e.Write([]byte{c})
+	return err
 }
 
 func pt(hmm int) float64 { return float64(hmm) * 72 / 2540 }
@@ -64,7 +87,8 @@ func num(v float64) string {
 	return strconv.FormatFloat(math.Round(v*100)/100, 'f', -1, 64)
 }
 
-func newDocWriter(buf *bytes.Buffer, set settings, doc docInfo, pages int) *docWriter {
+func newDocWriter(dst io.Writer, set settings, doc docInfo, pages int) *docWriter {
+	buf := &errWriter{w: dst}
 	w := &docWriter{buf: buf, set: set, doc: doc, pages: pages}
 	if set.PJL {
 		buf.WriteString(uel + "@PJL JOB\r\n@PJL ENTER LANGUAGE = POSTSCRIPT\r\n")
@@ -120,7 +144,7 @@ func newDocWriter(buf *bytes.Buffer, set settings, doc docInfo, pages int) *docW
 
 // feature requests a device setting without failing the job when the printer lacks it (no
 // duplexer, size not loaded): setpagedevice's configurationerror is caught by stopped.
-func feature(buf *bytes.Buffer, entries string) {
+func feature(buf io.Writer, entries string) {
 	fmt.Fprintf(buf, "[{ << %s >> setpagedevice } stopped cleartomark\n", entries)
 }
 
@@ -150,63 +174,97 @@ func (w *docWriter) page(img pageImage) error {
 		return err
 	}
 	w.buf.WriteString("pagesave restore\nshowpage\n")
-	return nil
+	return w.buf.err
 }
 
 func (w *docWriter) samples(data []byte) error {
-	var enc []byte
+	var dst io.Writer = w.buf
+	var a85 io.WriteCloser
+	if !w.set.Binary {
+		a85 = ascii85.NewEncoder(&a85Lines{w: w.buf})
+		dst = a85
+	}
 	if w.set.Level >= 3 {
-		var z bytes.Buffer
-		zw := zlib.NewWriter(&z)
+		zw := zlib.NewWriter(dst)
 		if _, err := zw.Write(data); err != nil {
 			return err
 		}
 		if err := zw.Close(); err != nil {
 			return err
 		}
-		enc = z.Bytes()
 	} else {
-		enc = imaging.PackBits(make([]byte, 0, len(data)/8+16), data)
-		enc = append(enc, 0x80)
+		if err := imaging.PackBitsTo(dst, data); err != nil {
+			return err
+		}
+		if _, err := dst.Write([]byte{0x80}); err != nil {
+			return err
+		}
 	}
-	if w.set.Binary {
-		w.buf.Write(enc)
-		w.buf.WriteByte('\n')
-		return nil
+	if a85 == nil {
+		return w.buf.WriteByte('\n')
 	}
-	writeASCII85(w.buf, enc)
-	return nil
+	if err := a85.Close(); err != nil {
+		return err
+	}
+	w.buf.WriteString("~>\n")
+	return w.buf.err
 }
 
 // writeASCII85 writes src as ASCII85 lines ending in the EOD marker "~>".
-func writeASCII85(buf *bytes.Buffer, src []byte) {
-	out := make([]byte, ascii85.MaxEncodedLen(len(src)))
-	out = out[:ascii85.Encode(out, src)]
-	for len(out) > 0 {
-		n := min(a85Line, len(out))
+func writeASCII85(w io.Writer, src []byte) {
+	enc := ascii85.NewEncoder(&a85Lines{w: w})
+	_, _ = enc.Write(src)
+	_ = enc.Close()
+	_, _ = io.WriteString(w, "~>\n")
+}
+
+// a85Lines breaks ASCII85 text into lines of a85Line characters.
+type a85Lines struct {
+	w   io.Writer
+	col int
+}
+
+func (l *a85Lines) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		if l.col == a85Line {
+			if _, err := l.w.Write([]byte{'\n'}); err != nil {
+				return 0, err
+			}
+			l.col = 0
+		}
 		// '%' is an ASCII85 digit; a line starting with it could read as a DSC comment such as
 		// %%EOF to a spooler. The decoder skips the space.
-		if out[0] == '%' {
-			buf.WriteByte(' ')
+		if l.col == 0 && p[0] == '%' {
+			if _, err := l.w.Write([]byte{' '}); err != nil {
+				return 0, err
+			}
 		}
-		buf.Write(out[:n])
-		out = out[n:]
-		if len(out) > 0 {
-			buf.WriteByte('\n')
+		k := min(a85Line-l.col, len(p))
+		if _, err := l.w.Write(p[:k]); err != nil {
+			return 0, err
 		}
+		l.col += k
+		p = p[k:]
 	}
-	buf.WriteString("~>\n")
+	return n, nil
 }
 
 func (w *docWriter) finish() error {
 	if w.n != w.pages {
 		return fmt.Errorf("postscript: wrote %d pages, announced %d", w.n, w.pages)
 	}
-	w.buf.WriteString("%%Trailer\n%%EOF\n")
+	_, _ = w.buf.Write(w.ending())
+	return w.buf.err
+}
+
+// ending closes the document, after the last page or after a failure between pages.
+func (w *docWriter) ending() []byte {
+	end := "%%Trailer\n%%EOF\n"
 	if w.set.PJL {
-		w.buf.WriteString(uel + "@PJL EOJ\r\n" + uel)
+		end += uel + "@PJL EOJ\r\n" + uel
 	}
-	return nil
+	return []byte(end)
 }
 
 // dscText makes client text (the job name) safe on a comment line: printable ASCII only, so a

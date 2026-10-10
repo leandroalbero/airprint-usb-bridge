@@ -21,3 +21,11 @@ func ownProcessGroup(cmd *exec.Cmd) {
 		return os.ErrProcessDone
 	}
 }
+
+// killGroup kills what is left of the filter's process group once the filter has exited, so a
+// wrapper's helpers do not outlive the job. The group id cannot be reused while any member lives.
+func killGroup(cmd *exec.Cmd) {
+	if cmd.Process != nil {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+}

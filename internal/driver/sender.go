@@ -1,7 +1,9 @@
 package driver
 
 import (
+	"bytes"
 	"context"
+	"io"
 
 	"github.com/leandroalbero/airprint-usb-bridge/internal/backend"
 )
@@ -48,6 +50,25 @@ func TransportSender(tr backend.Transport) Sender { return transportSender{tr} }
 type transportSender struct{ tr backend.Transport }
 
 func (s transportSender) Send(ctx context.Context, u Unit) error { return s.tr.Send(ctx, u.Data) }
+
+// SendStream streams through the transport when it can; otherwise it sends the unit whole.
+func (s transportSender) SendStream(ctx context.Context, u Unit, write func(io.Writer) error) error {
+	st, ok := s.tr.(backend.StreamTransport)
+	if !ok {
+		var buf bytes.Buffer
+		if err := write(&buf); err != nil {
+			return err
+		}
+		return s.tr.Send(ctx, buf.Bytes())
+	}
+	w := st.Stream(ctx)
+	err := write(w)
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
 func (s transportSender) State(ctx context.Context) (backend.State, error) {
 	return s.tr.State(ctx)
 }

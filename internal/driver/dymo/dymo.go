@@ -248,7 +248,9 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 			job.Log("page %d: %s label, %d of %d dot lines sent", n, media.Name, bottom, bm.H)
 			data = d.encode(bm, bottom, labelSearchLength(bm.H))
 		}
-		job.DebugImage(fmt.Sprintf("p%d-label", n), bm.Image())
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d-label", n), bm.Image())
+		}
 		out = append(out, rendered{n, data})
 	}
 	units := make([]driver.Unit, len(out))

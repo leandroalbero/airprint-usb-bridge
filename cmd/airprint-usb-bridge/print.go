@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"image/png"
@@ -20,10 +19,17 @@ import (
 // IPP jobs; a PNG goes to the driver's ImageRenderer (brother-ql prints it as one label,
 // left-aligned on the roll) or else is rendered as one page at the default resolution.
 func runPrint(ctx context.Context, o *options, path string, out io.Writer, logf logFunc) error {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
+	doc, err := docSection(f)
+	if err != nil {
+		return err
+	}
+	head := make([]byte, 8)
+	n, _ := doc.ReadAt(head, 0)
 	p, err := newPrinter(o, logf)
 	if err != nil {
 		return err
@@ -31,7 +37,7 @@ func runPrint(ctx context.Context, o *options, path string, out io.Writer, logf 
 	defer p.send.Close()
 
 	prefix := "print-" + time.Now().Format("20060102-150405")
-	info := driver.JobInfo{Name: filepath.Base(path), User: "local", Format: sniff(data)}
+	info := driver.JobInfo{Name: filepath.Base(path), User: "local", Format: sniff(head[:n])}
 	if o.highRes {
 		info.Quality = driver.QualityHigh
 	}
@@ -39,7 +45,7 @@ func runPrint(ctx context.Context, o *options, path string, out io.Writer, logf 
 	noun := p.noun()
 
 	if info.Format == "image/png" {
-		img, err := png.Decode(bytes.NewReader(data))
+		img, err := png.Decode(io.NewSectionReader(doc, 0, doc.Size()))
 		if err != nil {
 			return fmt.Errorf("png: %w", err)
 		}
@@ -54,7 +60,7 @@ func runPrint(ctx context.Context, o *options, path string, out io.Writer, logf 
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		if _, err := p.sendUnits(ctx, units, logf, nil); err != nil {
+		if _, err := p.sendUnits(ctx, units, logf, nil, nil); err != nil {
 			return err
 		}
 		if len(units) == 1 && units[0].Label != "" {
@@ -67,14 +73,14 @@ func runPrint(ctx context.Context, o *options, path string, out io.Writer, logf 
 
 	if p.debugDir != "" {
 		ext := strings.ToLower(filepath.Ext(path))
-		if err := os.WriteFile(filepath.Join(p.debugDir, prefix+"-in"+ext), data, 0o600); err != nil {
+		if err := copyFile(filepath.Join(p.debugDir, prefix+"-in"+ext), doc); err != nil {
 			logf("debug: %v", err)
 		}
 	}
-	n, err := p.printDocument(ctx, data, info, nil)
+	printed, err := p.printDocument(ctx, doc, info, nil)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "printed %d %s(s)\n", n, noun)
+	fmt.Fprintf(out, "printed %d %s(s)\n", printed, noun)
 	return nil
 }

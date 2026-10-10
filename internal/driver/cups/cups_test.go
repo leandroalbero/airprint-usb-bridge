@@ -54,6 +54,20 @@ func fakeFilter() int {
 		return 0
 	case "silent":
 		return 0
+	case "trailer":
+		if _, err := io.Copy(os.Stdout, os.Stdin); err != nil {
+			return 2
+		}
+		time.Sleep(300 * time.Millisecond)
+		os.Stdout.Write([]byte("JOB-END"))
+		return 0
+	case "trickle":
+		io.Copy(io.Discard, os.Stdin)
+		for i := 0; i < 10; i++ {
+			os.Stdout.Write([]byte("x"))
+			time.Sleep(200 * time.Millisecond)
+		}
+		return 0
 	}
 	in, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -90,6 +104,8 @@ func fakePPD(t *testing.T, extra string) string {
 *TestMode hang/Hang: ""
 *TestMode flood/Flood: ""
 *TestMode silent/Silent: ""
+*TestMode trickle/Trickle: ""
+*TestMode trailer/Trailer: ""
 *CloseUI: *TestMode
 ` + extra
 	path := filepath.Join(t.TempDir(), "fake.ppd")
@@ -492,9 +508,14 @@ func TestDriverFilterFailures(t *testing.T) {
 	d := newDriver(t, driver.Config{PPD: ppd, Options: map[string]string{"options": "TestMode=hang"}})
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
+	start := time.Now()
 	_, err := d.Render(ctx, drivertest.Job(t, d.Capabilities()), []raster.Page{sheet(d.Capabilities())})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("cancelled job: %v", err)
+	}
+	// Nothing reached the printer, so there is no device job to end: no grace.
+	if time.Since(start) > 10*time.Second {
+		t.Errorf("cancelled job without output took %v", time.Since(start))
 	}
 
 	_, err = d.Render(context.Background(), drivertest.Job(t, d.Capabilities()), []raster.Page{{Width: 10, Height: 10, XDPI: 300, YDPI: 300}})
@@ -507,12 +528,13 @@ func TestDriverFilterFailures(t *testing.T) {
 	}
 }
 
-// TestCapWriterBound checks that the output buffer never grows past max-output, so the cap also
-// bounds the memory it costs.
-func TestCapWriterBound(t *testing.T) {
+// TestOutWriter checks that the filter's output passes straight on, and that the filter is
+// stopped once it passes max-output or the destination fails.
+func TestOutWriter(t *testing.T) {
 	const limit = 1<<20 + 123
 	cancelled := false
-	w := &capWriter{max: limit, cancel: func() { cancelled = true }}
+	var dst bytes.Buffer
+	w := &outWriter{w: &dst, max: limit, cancel: func() { cancelled = true }, act: &activity{}}
 	chunk := bytes.Repeat([]byte{'x'}, 4093)
 	written := 0
 	for written+len(chunk) <= limit {
@@ -520,17 +542,28 @@ func TestCapWriterBound(t *testing.T) {
 			t.Fatalf("write at %d: %d %v", written, n, err)
 		}
 		written += len(chunk)
-		if cap(w.buf) > limit {
-			t.Fatalf("buffer capacity %d over the %d cap", cap(w.buf), limit)
-		}
 	}
-	if _, err := w.Write(chunk); !errors.Is(err, errOutputCap) || !cancelled || !w.over() {
+	if _, err := w.Write(chunk); !errors.Is(err, errOutputCap) || !cancelled {
 		t.Fatalf("over the cap: %v cancelled %v", err, cancelled)
 	}
-	if got := w.bytes(); len(got) != written || !bytes.Equal(got, bytes.Repeat([]byte{'x'}, written)) {
-		t.Fatalf("kept %d bytes, want %d", len(got), written)
+	if n, _, over := w.result(); n != int64(written) || !over || dst.Len() != written {
+		t.Fatalf("passed %d (%d), over %v, want %d", n, dst.Len(), over, written)
+	}
+
+	cancelled = false
+	broken := errors.New("printer gone")
+	w = &outWriter{w: failWriter{broken}, max: limit, cancel: func() { cancelled = true }, act: &activity{}}
+	if _, err := w.Write(chunk); !errors.Is(err, broken) || !cancelled {
+		t.Fatalf("broken destination: %v cancelled %v", err, cancelled)
+	}
+	if _, err, over := w.result(); !errors.Is(err, broken) || over {
+		t.Fatalf("result %v %v", err, over)
 	}
 }
+
+type failWriter struct{ err error }
+
+func (f failWriter) Write([]byte) (int, error) { return 0, f.err }
 
 func TestStderrLog(t *testing.T) {
 	var lines, msgs []string

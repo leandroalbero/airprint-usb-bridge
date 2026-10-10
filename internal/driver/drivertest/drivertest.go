@@ -109,6 +109,26 @@ func Run(t testing.TB, d driver.Driver, job driver.JobInfo, pages ...raster.Page
 	return res
 }
 
+// FailingPages is a PageReader over pages that fails with err after them, like a spool file
+// that cannot be read any further.
+func FailingPages(err error, pages ...raster.Page) driver.PageReader {
+	return &failingPages{pages: pages, err: err}
+}
+
+type failingPages struct {
+	pages []raster.Page
+	err   error
+}
+
+func (f *failingPages) Next() (raster.Page, error) {
+	if len(f.pages) == 0 {
+		return raster.Page{}, f.err
+	}
+	p := f.pages[0]
+	f.pages = f.pages[1:]
+	return p, nil
+}
+
 // Attributes returns the IPP attribute dump and the DNS-SD TXT record for caps.
 func Attributes(t testing.TB, caps driver.Capabilities) (string, map[string]string) {
 	t.Helper()

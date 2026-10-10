@@ -60,7 +60,8 @@ func newServiceFor(o *options, p *printer, logf logFunc) (*service, error) {
 		Host:             host + ".local",
 		Caps:             p.caps,
 		StateDir:         stateDir,
-		MaxDocumentBytes: maxDocumentBytes,
+		MaxDocumentBytes: p.maxDocumentBytes(),
+		MaxSpoolBytes:    p.maxSpoolBytes(),
 	}
 	if cfg.Name == "" {
 		cfg.Name = p.caps.MakeModel

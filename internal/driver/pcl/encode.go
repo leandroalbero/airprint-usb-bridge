@@ -19,8 +19,8 @@ type jobHeader struct {
 	duplexCapable bool
 }
 
-// jobBytes wraps the encoded pages in the job prologue and epilogue.
-func jobBytes(h jobHeader, pages []byte) []byte {
+// prologue starts the job: PJL header, reset and the job's page settings.
+func prologue(h jobHeader) []byte {
 	var b bytes.Buffer
 	if h.pjl {
 		fmt.Fprintf(&b, "%s@PJL JOB NAME=\"%s\"\r\n", uel, h.name)
@@ -36,7 +36,12 @@ func jobBytes(h jobHeader, pages []byte) []byte {
 	// Page size and orientation reset the text margins; set these after them.
 	b.WriteString("\x1b&l0L\x1b&l0E")
 	fmt.Fprintf(&b, "\x1b*t%dR", h.dpi)
-	b.Write(pages)
+	return b.Bytes()
+}
+
+// epilogue ends the job, after the last page or after a failure between pages.
+func epilogue(h jobHeader) []byte {
+	var b bytes.Buffer
 	b.WriteString("\x1bE")
 	if h.pjl {
 		fmt.Fprintf(&b, "%s@PJL EOJ NAME=\"%s\"\r\n%s", uel, h.name, uel)
@@ -49,12 +54,13 @@ type writer struct {
 	compression int
 	seed        []byte
 	buf         []byte
+	out         []byte // the last page, reused for the next
 }
 
 // page encodes one logical page: cursor at the top-left corner, the raster rows, form feed.
 // Trailing blank rows are not sent; other blank runs become ESC *b#Y.
 func (w *writer) page(bm *imaging.Bitmap) []byte {
-	var b []byte
+	b := w.out[:0]
 	b = append(b, "\x1b*p0x0Y"...)
 	b = append(b, "\x1b*r"+strconv.Itoa(bm.W)+"S"...)
 	b = append(b, "\x1b*b"+strconv.Itoa(w.compression)+"M"...)
@@ -83,6 +89,7 @@ func (w *writer) page(bm *imaging.Bitmap) []byte {
 		b = append(b, data...)
 	}
 	b = append(b, "\x1b*rB\f"...)
+	w.out = b
 	return b
 }
 

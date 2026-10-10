@@ -304,7 +304,9 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 			return nil, err
 		}
 		job.Log("page %d: %dx%d dots at %d dpi, dithered %v", i+1, bm.W, bm.H, dpi, dithered)
-		job.DebugImage(fmt.Sprintf("p%d", i+1), bm.Image())
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d", i+1), bm.Image())
+		}
 		units = append(units, driver.Unit{
 			Data:        d.Encode(bm),
 			Label:       fmt.Sprintf("label %d of %d", i+1, len(pages)),

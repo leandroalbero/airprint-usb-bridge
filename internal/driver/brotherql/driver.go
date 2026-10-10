@@ -312,7 +312,9 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 			dpi = 600
 		}
 		job.Log("page %d: label %d dots long (%.2f mm)", n, lab.Bitmap.H, float64(lab.Bitmap.H)*25.4/dpi)
-		job.DebugImage(fmt.Sprintf("p%d-label", n), BitmapImage(lab.Bitmap))
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d-label", n), BitmapImage(lab.Bitmap))
+		}
 		labels = append(labels, label{n, lab.Bitmap})
 	}
 	units := make([]driver.Unit, 0, len(labels))

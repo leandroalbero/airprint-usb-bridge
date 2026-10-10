@@ -103,8 +103,9 @@ encoded. `setpagedevice` sets the page size and duplex.
 
 Runs a CUPS raster driver without cupsd. It reads the PPD given with `--ppd`, writes CUPS raster
 (v3) pages with a correct page header for the chosen options, and runs the PPD's filter for
-`application/vnd.cups-raster` directly. There is no shell, and the run has a timeout and an
-output cap. The filter's `ERROR:` and `STATE:` lines go to the job log, and `ERROR:` lines also
+`application/vnd.cups-raster` directly. There is no shell, and the run has an inactivity
+timeout and an output cap. Pages are written to the filter as it reads them, and its output goes
+to the printer as it comes. The filter's `ERROR:` and `STATE:` lines go to the job log, and `ERROR:` lines also
 become the job's state message.
 
 ```sh
@@ -115,12 +116,14 @@ airprint-usb-bridge --driver cups --ppd /usr/share/ppd/example/laser.ppd
 - Options: `options="Key=Choice ..."` fixes PPD options for every job; `filter`, `filter-dir`,
   `timeout`, `max-output`, `kind=document|label`, `duplex=auto|true|false`, `full-page`,
   `device-uri`.
-- `max-output` (default `96M`) is held in memory, briefly up to about twice that while it
-  grows. Keep it well under the unit's `MemoryMax` (512M); raise both together.
-- Page sizes too large to render within the job's 128 MiB at the PPD's lowest resolution are
-  not offered, and a job falls back to a lower resolution when its size does not fit at the
-  one asked for.
+- `timeout` (default `5m`) is how long the filter may go without reading a page or writing
+  output; a long job on a slow printer is not cut short.
+- `max-output` (default `16G`) stops a runaway filter. The output is not held in memory.
+- Page sizes whose single sheet is over 128 MiB at the PPD's lowest resolution are not offered,
+  and a job falls back to a lower resolution when its size does not fit at the one asked for.
 - A filter that times out or whose job is cancelled is killed with every process it started.
+  When a page fails after printing has started, the filter's input ends there, so it can
+  finish the pages before it.
 - Filters are looked up in `/usr/lib/cups/filter` and `/usr/libexec/cups/filter`. The filter
   and the PPD must come from the same driver package.
 - Not supported: custom page sizes, `UIConstraints` and installable options. Set `duplex=false`
@@ -293,8 +296,11 @@ airprint-usb-bridge status               # query the printer once
 
 1. The document is decoded to grey: URF from Apple devices, PWG raster from other IPP
    Everywhere clients.
-2. The driver converts and checks **every page before anything is sent**. A page it cannot
-   print aborts the job with `document-format-error`, and nothing is half printed.
+2. **Every page is checked before anything is sent**. A page that cannot be decoded or
+   printed aborts the job with `document-format-error`, and nothing is half printed. Label
+   drivers convert every page first. Sheet drivers (pcl, postscript, cups) decode every page
+   once without keeping it, then read the document again and send each page as soon as it
+   is converted.
 3. Sheet drivers place each page on the sheet. Pages are scaled per `print-scaling` and turned
    to match the sheet's orientation. Unprintable margins are cleared, and the page is then
    binarized: photo-like pages are dithered, text and line art are thresholded.
@@ -304,11 +310,20 @@ airprint-usb-bridge status               # query the printer once
 
 If the printer is busy or not connected, the job is retried with back-off for up to two
 minutes. It is never retried once bytes have reached the printer, so nothing is printed twice.
+A job that fails or is cancelled after that is aborted. Where the printer language allows, the
+device job is still ended (PCL: `ESC E` and, unless `pjl=false`, the PJL end of job;
+PostScript: `%%EOF` and, with `pjl=true`, the PJL end of job; cups: the filter's input is
+closed), so the printer does not wait for the rest.
 
-A job's decoded pages are capped at 128 MiB, and so are the sheets a driver renders from them at
-the printer's resolution, whatever size the pages came in at. That is about 15 A4 pages at
-300 dpi, or 3 at 600 dpi. Longer documents are refused before anything is printed, so leave
-sheet drivers at 300 dpi unless you need 600. A job may hold at most 10000 pages.
+Sheet drivers hold about two pages in memory at a time, whatever the length of the document:
+the page being decoded and the sheet it becomes at the printer's resolution (35 MB each for A4
+at 600 dpi, 9 MB at 300 dpi). A document may be up to 512 MiB and 10000 pages, and the spool
+holds up to 1 GiB of waiting documents. A single page or sheet over 128 MiB is refused.
+
+Label drivers convert every page of a job before the first label prints. For them a document
+may be up to 64 MiB, and a job's decoded pages are capped at 128 MiB, and so are the sheets
+rendered from them at the printer's resolution (about 150 labels of 62x100 mm at 300 dpi).
+Longer jobs are refused before anything is printed.
 
 ### Brother QL specifics
 

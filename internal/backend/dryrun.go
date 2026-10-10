@@ -44,15 +44,10 @@ func (d *dryRun) Send(ctx context.Context, data []byte) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if err := os.MkdirAll(d.dir, 0o700); err != nil {
-		return fmt.Errorf("dry-run: %w", err)
+	base, n, err := d.nextBase()
+	if err != nil {
+		return err
 	}
-	if !d.scanned {
-		d.last = highestJob(d.dir)
-		d.scanned = true
-	}
-	n := d.last + 1
-	base := filepath.Join(d.dir, fmt.Sprintf("job-%d", n))
 	if err := os.WriteFile(base+".bin", data, 0o600); err != nil {
 		return fmt.Errorf("dry-run: %w", err)
 	}
@@ -63,6 +58,19 @@ func (d *dryRun) Send(ctx context.Context, data []byte) error {
 	}
 	d.last = n
 	return nil
+}
+
+// nextBase is the path of the next job-<n> without its extension.
+func (d *dryRun) nextBase() (string, int, error) {
+	if err := os.MkdirAll(d.dir, 0o700); err != nil {
+		return "", 0, fmt.Errorf("dry-run: %w", err)
+	}
+	if !d.scanned {
+		d.last = highestJob(d.dir)
+		d.scanned = true
+	}
+	n := d.last + 1
+	return filepath.Join(d.dir, fmt.Sprintf("job-%d", n)), n, nil
 }
 
 func highestJob(dir string) int {

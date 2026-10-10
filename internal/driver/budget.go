@@ -40,6 +40,17 @@ func (b *Budget) Charge(n int64) error {
 	return nil
 }
 
+// Release returns n bytes charged earlier, once the sheet they paid for is gone; a driver that
+// streams pages releases each sheet after sending it, so the budget bounds one page at a time.
+func (b *Budget) Release(n int64) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.used = max(b.used-n, 0)
+}
+
 // Check fails like Charge when a single allocation of n bytes is larger than the whole budget,
 // without taking anything from it.
 func (b *Budget) Check(n int64) error {

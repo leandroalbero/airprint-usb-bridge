@@ -68,15 +68,8 @@ func (u *usbTransport) Send(ctx context.Context, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	path, err := u.path()
+	port, path, err := u.openPort()
 	if err != nil {
-		return Retryable(err)
-	}
-	port, err := u.open(path, u.stall)
-	if err != nil {
-		if errors.Is(err, ErrDeviceBusy) || errors.Is(err, ErrNoPrinter) {
-			return Retryable(err)
-		}
 		return err
 	}
 	wrote := 0
@@ -103,6 +96,22 @@ func (u *usbTransport) Send(ctx context.Context, data []byte) error {
 		return fmt.Errorf("%s: %w: %w", path, ErrPartial, err)
 	}
 	return nil
+}
+
+// openPort opens the printer for one unit; only a printer that is absent or busy is worth a retry.
+func (u *usbTransport) openPort() (Port, string, error) {
+	path, err := u.path()
+	if err != nil {
+		return nil, "", Retryable(err)
+	}
+	port, err := u.open(path, u.stall)
+	if err != nil {
+		if errors.Is(err, ErrDeviceBusy) || errors.Is(err, ErrNoPrinter) {
+			return nil, path, Retryable(err)
+		}
+		return nil, path, err
+	}
+	return port, path, nil
 }
 
 func (u *usbTransport) State(ctx context.Context) (State, error) {

@@ -5,9 +5,11 @@
 package postscript
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -182,22 +184,44 @@ func copyPlan(copies, pages int) (numCopies, repeat int) {
 	return 1, copies
 }
 
-func repeatUnits(data []byte, n, impressions int, what string) []driver.Unit {
+func repeatUnits(n, impressions int, what string, meta any) []driver.Unit {
 	units := make([]driver.Unit, n)
 	for i := range units {
 		label := what
 		if n > 1 {
 			label = fmt.Sprintf("%s, copy %d of %d", what, i+1, n)
 		}
-		units[i] = driver.Unit{Data: data, Label: label, Impressions: impressions}
+		units[i] = driver.Unit{Label: label, Impressions: impressions, Meta: meta}
 	}
 	return units
 }
 
-// Render places every page on the job's sheet and encodes it. The whole document is built before
-// it returns; nothing is sent from here.
+// Render is the job rendered in memory; the bridge streams it instead (Stream).
 func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.Page) ([]driver.Unit, error) {
-	if len(pages) == 0 {
+	return driver.RenderStream(ctx, d, job, pages)
+}
+
+func (d *Driver) placeOptions(job driver.JobInfo, dpi int) imaging.PlaceOptions {
+	return imaging.PlaceOptions{XDPI: dpi, YDPI: dpi, Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget}
+}
+
+// CheckPage checks that page n can be placed on the job's sheet.
+func (d *Driver) CheckPage(job driver.JobInfo, n int, p raster.Page) error {
+	if job.Media.Width <= 0 || job.Media.Length <= 0 {
+		return nil // Plan refuses the job
+	}
+	if err := imaging.CheckPlace(p, job.Media, d.placeOptions(job, d.outputDPI(p))); err != nil {
+		return driver.DocumentError(fmt.Errorf("postscript: page %d: %w", n, err))
+	}
+	return nil
+}
+
+// jobPlan is what Plan tells Stream: the page count goes in the document header.
+type jobPlan struct{ pages, numCopies int }
+
+// Plan makes one document of every page, repeated per copy unless /NumCopies does it.
+func (d *Driver) Plan(job driver.JobInfo, pages int) ([]driver.Unit, error) {
+	if pages == 0 {
 		return nil, nil
 	}
 	media := job.Media
@@ -207,111 +231,219 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 	if job.Sides != "" && job.Sides != "one-sided" && !d.set.Duplex {
 		job.Log("sides %s ignored: printer has no duplexer (driver option duplex=true)", job.Sides)
 	}
-	numCopies, repeat := copyPlan(job.Copies, len(pages))
-	var buf bytes.Buffer
-	w := newDocWriter(&buf, d.set, docInfo{
-		Title: job.Name, Width: media.Width, Length: media.Length, Sides: job.Sides, NumCopies: numCopies,
-	}, len(pages))
-	for i, p := range pages {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		dpi := d.outputDPI(p)
-		sheet, err := imaging.Place(p, media, imaging.PlaceOptions{
-			XDPI: dpi, YDPI: dpi, Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget,
-		})
-		if err != nil {
-			return nil, driver.DocumentError(fmt.Errorf("postscript: page %d: %w", i+1, err))
-		}
-		pages[i].Gray = nil
-		img := pageImage{W: sheet.Width, H: sheet.Height, XDPI: dpi, YDPI: dpi, Depth: d.set.Depth}
-		if d.set.Depth == 8 {
-			img.Data = sheet.Gray
-			job.Log("page %d: %dx%d gray at %d dpi on %s", i+1, img.W, img.H, dpi, media.Name)
-			job.DebugImage(fmt.Sprintf("p%d", i+1), imaging.GrayImage(sheet))
-		} else {
-			bm, dithered, err := imaging.Binarize(sheet, d.dither)
-			if err != nil {
-				return nil, driver.DocumentError(fmt.Errorf("postscript: page %d: %w", i+1, err))
-			}
-			img.Data = bm.Pix
-			job.Log("page %d: %dx%d dots at %d dpi on %s, dithered %v", i+1, img.W, img.H, dpi, media.Name, dithered)
-			job.DebugImage(fmt.Sprintf("p%d", i+1), bm.Image())
-		}
-		if err := w.page(img); err != nil {
-			return nil, err
-		}
-	}
-	if err := w.finish(); err != nil {
-		return nil, err
-	}
-	return repeatUnits(buf.Bytes(), repeat, len(pages)*numCopies, fmt.Sprintf("job (%d pages)", len(pages))), nil
+	numCopies, repeat := copyPlan(job.Copies, pages)
+	return repeatUnits(repeat, pages*numCopies, fmt.Sprintf("job (%d pages)", pages), jobPlan{pages, numCopies}), nil
 }
 
-// RenderDocument sends an application/postscript document as it is, after an optional Duplex
-// request (only on a duplex printer) and the optional PJL wrapper. Copies are whole repeated jobs:
-// rewriting /NumCopies inside a client's document is not safe.
-func (d *Driver) RenderDocument(ctx context.Context, job driver.JobInfo, format string, data []byte) ([]driver.Unit, error) {
-	if !d.passthrough || format != formatPS {
-		return nil, driver.DocumentErrorf("postscript: cannot print %s (driver option passthrough=true accepts %s)", format, formatPS)
+// Stream places every page on the job's sheet and encodes it as it goes. Output is buffered
+// until a page is complete enough to be worth a write; a job that fails before its first write
+// sends nothing, and one that fails later still gets the document's ending.
+func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, pages driver.PageReader, w io.Writer) error {
+	plan, ok := u.Meta.(jobPlan)
+	if !ok {
+		return fmt.Errorf("postscript: unit %q was not planned by this driver", u.Label)
 	}
+	media := job.Media
+	out := driver.NewOutput(ctx, w)
+	bw := bufio.NewWriterSize(out, 64<<10)
+	doc := newDocWriter(bw, d.set, docInfo{
+		Title: job.Name, Width: media.Width, Length: media.Length, Sides: job.Sides, NumCopies: plan.numCopies,
+	}, plan.pages)
+	fail := func(err error) error {
+		if out.Written() == 0 {
+			return err
+		}
+		_ = bw.Flush()
+		return out.Abort(err, doc.ending())
+	}
+	for n := 1; ; n++ {
+		if err := out.Err(); err != nil {
+			return fail(err)
+		}
+		p, err := pages.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fail(err)
+		}
+		if err := d.page(job, doc, p, n); err != nil {
+			return fail(err)
+		}
+	}
+	if err := doc.finish(); err != nil {
+		return fail(err)
+	}
+	if err := bw.Flush(); err != nil {
+		return out.Abort(err, nil)
+	}
+	return nil
+}
+
+// page places page n on the sheet and writes it to doc.
+func (d *Driver) page(job driver.JobInfo, doc *docWriter, p raster.Page, n int) error {
+	media := job.Media
+	dpi := d.outputDPI(p)
+	o := d.placeOptions(job, dpi)
+	o.InPlace = true
+	sheet, err := imaging.Place(p, media, o)
+	if err != nil {
+		return driver.DocumentError(fmt.Errorf("postscript: page %d: %w", n, err))
+	}
+	defer job.Budget.Release(int64(sheet.Width) * int64(sheet.Height))
+	img := pageImage{W: sheet.Width, H: sheet.Height, XDPI: dpi, YDPI: dpi, Depth: d.set.Depth}
+	if d.set.Depth == 8 {
+		img.Data = sheet.Gray
+		job.Log("page %d: %dx%d gray at %d dpi on %s", n, img.W, img.H, dpi, media.Name)
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d", n), imaging.GrayImage(sheet))
+		}
+	} else {
+		bm, dithered, err := imaging.Binarize(sheet, d.dither)
+		if err != nil {
+			return driver.DocumentError(fmt.Errorf("postscript: page %d: %w", n, err))
+		}
+		img.Data = bm.Pix
+		job.Log("page %d: %dx%d dots at %d dpi on %s, dithered %v", n, img.W, img.H, dpi, media.Name, dithered)
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d", n), bm.Image())
+		}
+	}
+	return doc.page(img)
+}
+
+// RenderDocument is the pass-through document rendered in memory; the bridge streams it instead
+// (StreamDocument).
+func (d *Driver) RenderDocument(ctx context.Context, job driver.JobInfo, format string, data []byte) ([]driver.Unit, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	wrapped := bytes.HasPrefix(data, []byte(uel))
-	if !wrapped && !bytes.HasPrefix(bytes.TrimLeft(data, "\x04"), []byte("%!")) {
+	doc := io.NewSectionReader(bytes.NewReader(data), 0, int64(len(data)))
+	units, err := d.PlanDocument(job, format, doc)
+	if err != nil || len(units) == 0 {
+		return units, err
+	}
+	var buf bytes.Buffer
+	if err := d.StreamDocument(ctx, job, units[0], doc, &buf); err != nil {
+		return nil, err
+	}
+	for i := range units {
+		units[i].Data = buf.Bytes()
+	}
+	return units, nil
+}
+
+// docPlan is what PlanDocument tells StreamDocument.
+type docPlan struct {
+	wrapped bool  // the document brings its own PJL job
+	skip    int64 // leading ^D bytes left out
+}
+
+// PlanDocument checks an application/postscript document and counts its pages. Copies are whole
+// repeated jobs: rewriting /NumCopies inside a client's document is not safe.
+func (d *Driver) PlanDocument(job driver.JobInfo, format string, doc *io.SectionReader) ([]driver.Unit, error) {
+	if !d.passthrough || format != formatPS {
+		return nil, driver.DocumentErrorf("postscript: cannot print %s (driver option passthrough=true accepts %s)", format, formatPS)
+	}
+	br := bufio.NewReader(io.NewSectionReader(doc, 0, doc.Size()))
+	head, _ := br.Peek(len(uel))
+	plan := docPlan{wrapped: bytes.HasPrefix(head, []byte(uel))}
+	var ctrlD int64
+	for {
+		b, err := br.ReadByte()
+		if err != nil || b != 0x04 {
+			break
+		}
+		ctrlD++
+	}
+	start := make([]byte, 2)
+	n, _ := io.ReadFull(io.NewSectionReader(doc, ctrlD, 2), start)
+	if !plan.wrapped && !bytes.HasPrefix(start[:n], []byte("%!")) {
 		return nil, driver.DocumentErrorf("postscript: document does not start with %%!")
 	}
-	pages := dscPages(data)
-	var buf bytes.Buffer
-	if d.set.PJL && !wrapped {
-		buf.WriteString(uel + "@PJL JOB\r\n@PJL ENTER LANGUAGE = POSTSCRIPT\r\n")
-	}
-	if d.set.Duplex && !wrapped {
+	size := doc.Size()
+	if d.set.Duplex && !plan.wrapped {
 		// ^D ends a job on some channels; left in front of the document it would reset the
 		// Duplex request made just before it.
-		data = bytes.TrimLeft(data, "\x04")
-		buf.WriteString("%!PS\n")
-		var setup bytes.Buffer
+		plan.skip = ctrlD
+		size -= ctrlD
+	}
+	pages, err := dscPagesFrom(io.NewSectionReader(doc, 0, doc.Size()))
+	if err != nil {
+		return nil, err
+	}
+	job.Log("PostScript pass-through: %d bytes, %d pages", size, pages)
+	return repeatUnits(max(job.Copies, 1), pages, fmt.Sprintf("PostScript document (%d pages)", pages), plan), nil
+}
+
+// StreamDocument sends the document as it is, after an optional Duplex request (only on a duplex
+// printer) and inside the optional PJL wrapper.
+func (d *Driver) StreamDocument(ctx context.Context, job driver.JobInfo, u driver.Unit, doc *io.SectionReader, w io.Writer) error {
+	plan, ok := u.Meta.(docPlan)
+	if !ok {
+		return fmt.Errorf("postscript: unit %q was not planned by this driver", u.Label)
+	}
+	out := driver.NewOutput(ctx, w)
+	var head, end bytes.Buffer
+	if d.set.PJL && !plan.wrapped {
+		head.WriteString(uel + "@PJL JOB\r\n@PJL ENTER LANGUAGE = POSTSCRIPT\r\n")
+		end.WriteString(uel + "@PJL EOJ\r\n" + uel)
+	}
+	if d.set.Duplex && !plan.wrapped {
+		head.WriteString("%!PS\n")
 		switch job.Sides {
 		case "two-sided-long-edge":
-			feature(&setup, "/Duplex true /Tumble false")
+			feature(&head, "/Duplex true /Tumble false")
 		case "two-sided-short-edge":
-			feature(&setup, "/Duplex true /Tumble true")
+			feature(&head, "/Duplex true /Tumble true")
 		default:
-			feature(&setup, "/Duplex false")
+			feature(&head, "/Duplex false")
 		}
-		buf.Write(setup.Bytes())
 	}
-	buf.Write(data)
-	if d.set.PJL && !wrapped {
-		buf.WriteString(uel + "@PJL EOJ\r\n" + uel)
+	body := io.NewSectionReader(doc, plan.skip, doc.Size()-plan.skip)
+	buf := make([]byte, 64<<10)
+	n := copy(buf, head.Bytes())
+	for {
+		if err := out.Err(); err != nil {
+			return out.Abort(err, end.Bytes())
+		}
+		m, err := io.ReadFull(body, buf[n:])
+		n += m
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return out.Abort(werr, nil)
+			}
+			n = 0
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return out.Abort(err, end.Bytes())
+		}
 	}
-	job.Log("PostScript pass-through: %d bytes, %d pages", len(data), pages)
-	return repeatUnits(buf.Bytes(), max(job.Copies, 1), pages, fmt.Sprintf("PostScript document (%d pages)", pages)), nil
+	if _, err := out.Write(end.Bytes()); err != nil {
+		return out.Abort(err, nil)
+	}
+	return nil
 }
 
 // dscPages reads %%Pages from the document's comments: the first number, or the trailer's when
 // the header says (atend). Documents without it count as one impression.
 func dscPages(data []byte) int {
+	n, _ := dscPagesFrom(bytes.NewReader(data))
+	return n
+}
+
+// dscPagesFrom is dscPages over a stream. A %%Pages comment counts only at the start of a line
+// (after CR or LF); its value is the first field of the rest of the line.
+func dscPagesFrom(r io.Reader) (int, error) {
+	const keep = 4096
+	key := []byte("%%Pages:")
 	first, last := 0, 0
 	atend := false
-	key := []byte("%%Pages:")
-	for i := 0; i < len(data); {
-		j := bytes.Index(data[i:], key)
-		if j < 0 {
-			break
-		}
-		at := i + j
-		i = at + len(key)
-		if at > 0 && data[at-1] != '\n' && data[at-1] != '\r' {
-			continue
-		}
-		end := bytes.IndexAny(data[i:], "\r\n")
-		if end < 0 {
-			end = len(data) - i
-		}
-		f := strings.Fields(string(data[i : i+end]))
+	value := func(v []byte) {
+		f := strings.Fields(string(v))
 		switch {
 		case len(f) == 0:
 		case f[0] == "(atend)":
@@ -325,9 +457,46 @@ func dscPages(data []byte) int {
 			}
 		}
 	}
+	var line []byte // the start of the current line while it may be a %%Pages comment
+	maybe := true
+	add := func(seg []byte) {
+		if !maybe {
+			return
+		}
+		line = append(line, seg[:min(len(seg), keep+len(key)-len(line))]...)
+		k := min(len(line), len(key))
+		maybe = bytes.Equal(line[:k], key[:k])
+	}
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := r.Read(buf)
+		chunk := buf[:n]
+		for len(chunk) > 0 {
+			i := bytes.IndexAny(chunk, "\r\n")
+			if i < 0 {
+				add(chunk)
+				break
+			}
+			add(chunk[:i])
+			if maybe && len(line) >= len(key) {
+				value(line[len(key):])
+			}
+			line, maybe = line[:0], true
+			chunk = chunk[i+1:]
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	if maybe && len(line) >= len(key) {
+		value(line[len(key):])
+	}
 	n := first
 	if atend || n == 0 {
 		n = last
 	}
-	return max(n, 1)
+	return max(n, 1), nil
 }
