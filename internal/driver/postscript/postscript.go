@@ -1,7 +1,8 @@
 // Package postscript is the postscript driver: PostScript level 2/3 printers. Each page is placed
 // on the sheet and sent as one LanguageLevel 2 image (RunLengthDecode, or FlateDecode at level 3,
 // ASCII85-wrapped by default), with PageSize, Duplex and NumCopies set through setpagedevice.
-// application/postscript documents can optionally be passed through unchanged.
+// Colour jobs on a colour printer are 8-bit DeviceRGB images. application/postscript documents
+// can optionally be passed through unchanged.
 package postscript
 
 import (
@@ -15,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/leandroalbero/airprint-usb-bridge/internal/driver"
+	"github.com/leandroalbero/airprint-usb-bridge/internal/driver/cups"
 	"github.com/leandroalbero/airprint-usb-bridge/internal/imaging"
 	"github.com/leandroalbero/airprint-usb-bridge/internal/raster"
 )
@@ -39,6 +41,7 @@ type Driver struct {
 	set         settings
 	dither      string
 	passthrough bool
+	color       bool
 }
 
 // New builds the driver from the bridge configuration and its --driver-opt options.
@@ -87,6 +90,10 @@ func New(cfg driver.Config) (driver.Driver, error) {
 		return nil, fmt.Errorf("dither %q: want auto, on or off", cfg.Dither)
 	}
 
+	if d.color, err = colorFromConfig(cfg); err != nil {
+		return nil, err
+	}
+
 	names := make([]string, len(mediaIDs))
 	for i, m := range mediaIDs {
 		names[i] = m.name
@@ -109,7 +116,13 @@ func New(cfg driver.Config) (driver.Driver, error) {
 		res = []driver.Resolution{{X: 600, Y: 600}, {X: 300, Y: 300}}
 		rs = "RS300-600"
 	}
-	urf := []string{"V1.4", "W8", "CP" + strconv.Itoa(maxCopies)}
+	urf := []string{"V1.4", "W8"}
+	pwg := []string{"sgray_8"}
+	if d.color {
+		urf = append(urf, "SRGB24")
+		pwg = append(pwg, "srgb_8")
+	}
+	urf = append(urf, "CP"+strconv.Itoa(maxCopies))
 	if d.set.Duplex {
 		urf = append(urf, "DM1")
 	}
@@ -121,11 +134,12 @@ func New(cfg driver.Config) (driver.Driver, error) {
 	d.caps = driver.Capabilities{
 		MakeModel:    makeModel(cfg),
 		Kind:         []string{"document"},
+		Color:        d.color,
 		Duplex:       d.set.Duplex,
 		Resolutions:  res,
 		Qualities:    []int{driver.QualityNormal},
 		URF:          urf,
-		PWGTypes:     []string{"sgray_8"},
+		PWGTypes:     pwg,
 		Formats:      formats,
 		MaxCopies:    maxCopies,
 		CopiesNative: true,
@@ -133,6 +147,34 @@ func New(cfg driver.Config) (driver.Driver, error) {
 		DefaultMedia: def,
 	}
 	return &d, nil
+}
+
+// colorFromConfig is --color: on, off, or auto, which is on when --ppd names a PPD that says
+// *ColorDevice: True and off otherwise.
+func colorFromConfig(cfg driver.Config) (bool, error) {
+	switch cfg.Color {
+	case "on":
+		return true, nil
+	case "off":
+		return false, nil
+	case "", "auto":
+	default:
+		return false, fmt.Errorf("color %q: want auto, on or off", cfg.Color)
+	}
+	if cfg.PPD == "" {
+		return false, nil
+	}
+	ppd, err := cups.LoadPPD(cfg.PPD)
+	if err != nil {
+		return false, fmt.Errorf("--ppd: %w", err)
+	}
+	v, ok := ppd.Attr("ColorDevice", "")
+	color := strings.EqualFold(strings.Trim(v, `"`), "true")
+	if !ok {
+		v = "(none)"
+	}
+	cfg.Log("postscript: %s: *ColorDevice %s, colour %v", cfg.PPD, v, color)
+	return color, nil
 }
 
 func pickMedia(id string) (string, error) {
@@ -202,7 +244,12 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 }
 
 func (d *Driver) placeOptions(job driver.JobInfo, dpi int) imaging.PlaceOptions {
-	return imaging.PlaceOptions{XDPI: dpi, YDPI: dpi, Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget}
+	return imaging.PlaceOptions{XDPI: dpi, YDPI: dpi, Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget, Color: d.colorJob(job)}
+}
+
+// colorJob reports whether job is printed with RGB images.
+func (d *Driver) colorJob(job driver.JobInfo) bool {
+	return d.color && job.Color
 }
 
 // CheckPage checks that page n can be placed on the job's sheet.
@@ -248,6 +295,7 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, 
 	bw := bufio.NewWriterSize(out, 64<<10)
 	doc := newDocWriter(bw, d.set, docInfo{
 		Title: job.Name, Width: media.Width, Length: media.Length, Sides: job.Sides, NumCopies: plan.numCopies,
+		Color: d.colorJob(job),
 	}, plan.pages)
 	fail := func(err error) error {
 		if out.Written() == 0 {
@@ -256,6 +304,7 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, 
 		_ = bw.Flush()
 		return out.Abort(err, doc.ending())
 	}
+	var reuse []byte
 	for n := 1; ; n++ {
 		if err := out.Err(); err != nil {
 			return fail(err)
@@ -267,7 +316,7 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, 
 		if err != nil {
 			return fail(err)
 		}
-		if err := d.page(job, doc, p, n); err != nil {
+		if err := d.page(job, doc, p, n, &reuse); err != nil {
 			return fail(err)
 		}
 	}
@@ -281,24 +330,35 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, 
 }
 
 // page places page n on the sheet and writes it to doc.
-func (d *Driver) page(job driver.JobInfo, doc *docWriter, p raster.Page, n int) error {
+func (d *Driver) page(job driver.JobInfo, doc *docWriter, p raster.Page, n int, reuse *[]byte) error {
 	media := job.Media
 	dpi := d.outputDPI(p)
+	if !d.colorJob(job) {
+		p = imaging.GrayFromRGB(p)
+	}
 	o := d.placeOptions(job, dpi)
-	o.InPlace = true
+	o.InPlace, o.Reuse = true, reuse
 	sheet, err := imaging.Place(p, media, o)
 	if err != nil {
 		return driver.DocumentError(fmt.Errorf("postscript: page %d: %w", n, err))
 	}
-	defer job.Budget.Release(int64(sheet.Width) * int64(sheet.Height))
+	_, ch := sheet.Pix()
+	defer job.Budget.Release(int64(sheet.Width) * int64(sheet.Height) * int64(ch))
 	img := pageImage{W: sheet.Width, H: sheet.Height, XDPI: dpi, YDPI: dpi, Depth: d.set.Depth}
-	if d.set.Depth == 8 {
+	switch {
+	case sheet.RGB != nil:
+		img.Depth, img.RGB, img.Data = 8, true, sheet.RGB
+		job.Log("page %d: %dx%d RGB at %d dpi on %s", n, img.W, img.H, dpi, media.Name)
+		if job.Debug != nil {
+			job.DebugImage(fmt.Sprintf("p%d", n), imaging.RGBImage(sheet))
+		}
+	case d.set.Depth == 8:
 		img.Data = sheet.Gray
 		job.Log("page %d: %dx%d gray at %d dpi on %s", n, img.W, img.H, dpi, media.Name)
 		if job.Debug != nil {
 			job.DebugImage(fmt.Sprintf("p%d", n), imaging.GrayImage(sheet))
 		}
-	} else {
+	default:
 		bm, dithered, err := imaging.Binarize(sheet, d.dither)
 		if err != nil {
 			return driver.DocumentError(fmt.Errorf("postscript: page %d: %w", n, err))

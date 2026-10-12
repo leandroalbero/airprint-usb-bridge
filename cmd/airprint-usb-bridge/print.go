@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"image"
 	"image/png"
 	"io"
 	"os"
@@ -55,7 +56,20 @@ func runPrint(ctx context.Context, o *options, path string, out io.Writer, logf 
 		} else {
 			info.Format = "image/urf"
 			res := p.caps.Resolutions[0]
-			units, err = p.drv.Render(ctx, info, []raster.Page{imaging.FromImage(img, res.X)})
+			page := imaging.FromImage(img, res.X)
+			color := false
+			switch img.(type) {
+			case *image.Gray, *image.Gray16:
+			default:
+				if info.Color {
+					if rgb := imaging.FromImageRGB(img, res.X); !grayRGB(rgb.RGB) {
+						page, color = rgb, true
+					}
+				}
+			}
+			// As for raster documents, an image without a colour pixel is the gray job.
+			info.Color = color
+			units, err = p.drv.Render(ctx, info, []raster.Page{page})
 		}
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
@@ -83,4 +97,14 @@ func runPrint(ctx context.Context, o *options, path string, out io.Writer, logf 
 	}
 	fmt.Fprintf(out, "printed %d %s(s)\n", printed, noun)
 	return nil
+}
+
+// grayRGB reports whether every RGB pixel has R, G and B equal.
+func grayRGB(rgb []byte) bool {
+	for i := 0; i+2 < len(rgb); i += 3 {
+		if rgb[i] != rgb[i+1] || rgb[i+1] != rgb[i+2] {
+			return false
+		}
+	}
+	return true
 }

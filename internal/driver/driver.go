@@ -59,6 +59,11 @@ type JobInfo struct {
 	Orientation int    // orientation-requested: 3 portrait, 4 landscape, 5 reverse-landscape, 6 reverse-portrait; 0 absent
 	Scaling     string // print-scaling: "auto", "auto-fit", "fill", "fit", "none"; "" absent
 	Resolution  Resolution
+	// Color says the job prints in colour: the printer advertises colour, the job's ColorMode
+	// asks for it (Capabilities.UseColor) and the document has colour pages. Its pages then
+	// come as raster.Page.RGB; a driver may still be handed gray pages and must print them.
+	// It is decided before the first page, so a driver can set up the job's colour mode.
+	Color bool
 
 	// Logf receives progress lines for the job log; nil means silent. Use Log.
 	Logf func(format string, args ...any)

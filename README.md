@@ -3,7 +3,9 @@
 `airprint-usb-bridge` makes a USB printer show up on your network as an AirPrint / IPP
 Everywhere printer. iPhones, iPads, Macs and driverless Linux clients print to it without a
 driver or an app plugin. Pages are turned into printer bytes by a pluggable driver, so the same
-binary can serve a label printer, a mono laser, or any printer that has a CUPS raster driver.
+binary can serve a label printer, a mono or colour laser, or any printer that has a CUPS raster
+driver. Colour printers stay colour printers: colour jobs print in colour, and the client's
+black-and-white switch still prints gray.
 
 It is a single static Go binary, with no cgo. It contains:
 
@@ -37,14 +39,14 @@ It helps in these cases:
 
 ## Drivers
 
-| Driver | Printers | Verified on hardware |
-|---|---|---|
-| `brother-ql` | Brother QL label printers, continuous rolls | **yes**: QL-700 with the 62 mm DK-22205 roll. Other QL models: no |
-| `pcl` | mono lasers that accept PCL 5 raster | no |
-| `postscript` | PostScript level 2/3 printers | no |
-| `cups` | any printer with a CUPS raster driver (PPD plus filter) | no |
-| `dymo` | DYMO LabelWriter 400, 450, 450 Turbo, 4XL (not the 5xx series) | no |
-| `zpl` | Zebra and other ZPL II label printers | no |
+| Driver | Printers | Colour | Verified on hardware |
+|---|---|---|---|
+| `brother-ql` | Brother QL label printers, continuous rolls | no (black only) | **yes**: QL-700 with the 62 mm DK-22205 roll. Other QL models: no |
+| `pcl` | lasers that accept PCL 5 raster | with `--color on` (PCL 5c, 24-bit RGB) | no |
+| `postscript` | PostScript level 2/3 printers | with `--color on`, or `auto` and a `--ppd` saying `*ColorDevice: True` | no |
+| `cups` | any printer with a CUPS raster driver (PPD plus filter) | when the PPD has a colour `ColorModel` (default `--color auto`) | no |
+| `dymo` | DYMO LabelWriter 400, 450, 450 Turbo, 4XL (not the 5xx series) | no | no |
+| `zpl` | Zebra and other ZPL II label printers | no | no |
 
 Only the Brother QL-700 has been tested end to end. Every other driver and model is built from
 public protocol references and checked with golden-byte tests, decoders written independently
@@ -79,14 +81,21 @@ tried on a printer.
 
 ### pcl
 
-PCL 5 raster for mono lasers: a PJL job wrapper, page size, 300 or 600 dpi raster with
-compression mode 2 (TIFF PackBits) or 3 (delta row), and optional duplex.
+PCL 5 raster: a PJL job wrapper, page size, 300 or 600 dpi raster with compression mode 2 (TIFF
+PackBits) or 3 (delta row), and optional duplex. Mono by default.
 
 - Media: A4 (default), Letter, Legal, A5, Executive (`--media a4|letter|...`).
 - Margins: 4.23 mm top and bottom; the sides follow PCL's logical page, about 6 mm.
 - Options: `dpi=300|600|300,600`, `duplex=true`, `compression=2|3`, `pjl=false`.
 - Auto-selected when the device ID's command set lists PCL. Printers that list only PCL 3 GUI
   (many inkjets) get a warning: their PCL dialect is vendor-specific.
+- Colour, with `--color on`: colour jobs are sent as PCL 5c raster, set up with the short
+  Configure Image Data command (`ESC *v6W` 00 03 00 08 08 08: device RGB, direct by pixel,
+  8 bits per primary) from HP's PCL 5 Color Technical Reference, and full-width 24-bit rows in
+  delta row compression (mode 3, as in that reference's 24-bit example, whatever
+  `compression` says). Gray and black-and-white jobs stay the mono PCL 5 job. **Unverified**: no colour laser has printed it. Many colour
+  LaserJets only print colour from PCL XL (PCL 6) or PostScript; for those, the `cups` driver
+  with the vendor's PPD and filter, or `postscript`, is the safer route.
 
 ### postscript
 
@@ -98,6 +107,14 @@ encoded. `setpagedevice` sets the page size and duplex.
   `resolution=300|600`, `duplex=true`, `pjl=true`.
 - `passthrough=true` also accepts `application/postscript` documents and sends them unchanged.
   This is off by default, because a document can change the printer's saved settings.
+- Colour: `--color on`, or `--color auto` (the default) with `--ppd` naming the printer's PPD
+  when it says `*ColorDevice: True`. Colour jobs are 8-bit `DeviceRGB` images with the same
+  RunLength/Flate and ASCII85/binary options (`depth` applies to gray pages only); gray and
+  black-and-white jobs are unchanged. At level 2 each row goes as an R, a G and a B row
+  (`MultipleDataSources`), so flat colour compresses (a flat-colour A4 page at 600 dpi is about
+  2 MB, 1.7 MB with `encoding=binary`); photos barely compress at level 2: up to about 130 MB
+  per A4 page at 600 dpi (105 MB binary), a quarter of that at 300 dpi. `level=3` (Flate) is
+  much smaller where the printer has it.
 
 ### cups
 
@@ -126,6 +143,19 @@ airprint-usb-bridge --driver cups --ppd /usr/share/ppd/example/laser.ppd
   finish the pages before it.
 - Filters are looked up in `/usr/lib/cups/filter` and `/usr/libexec/cups/filter`. The filter
   and the PPD must come from the same driver package.
+- Colour: the printer is advertised as colour when the PPD has a `ColorModel` choice whose
+  raster format is colour (the PPD default if it is one, else the first), or, without a
+  `ColorModel` option, when its default raster is colour and it says `*ColorDevice: True`.
+  A PPD that says `*ColorDevice: False` stays gray, as CUPS treats it, unless `--color on`.
+  Colour jobs use that choice; gray and black-and-white jobs keep the gray `ColorModel` they
+  always used. RGB pages are converted line by line to the filter's format: RGB as is, CMY as
+  255 minus RGB, CMYK/KCMY/YMCK with simple black generation (K = min(C, M, Y), then
+  subtracted), 1, 2, 4, 8 or 16 bits per colour in chunked, banded or planar order. 1, 2 and
+  4-bit formats are error-diffused per channel when `--dither` is `on`, or `auto` and the page
+  looks like a photo; otherwise 1 bit is thresholded and 2 and 4 bits keep the top bits of each
+  value, as gray is (gray itself is only ever diffused at 1 bit). `--color off` keeps a colour
+  PPD gray; `--color on` fails when the PPD has no colour model. A `ColorModel` pinned with
+  `options=` is used as it is.
 - Not supported: custom page sizes, `UIConstraints` and installable options. Set `duplex=false`
   if no duplexer is fitted.
 
@@ -257,6 +287,7 @@ set in a `key = value` config file given with `--config`; the command line wins.
 | `--ppd` | | PPD file for the `cups` driver |
 | `--media` | per driver | media id; see `drivers` |
 | `--dither` | `auto` | `auto`, `on` or `off` |
+| `--color` | `auto` | colour printing: `auto`, `on` or `off` (see each driver; label drivers print black only) |
 | `--high-res` | off | offer print-quality high where the driver can |
 | `--profile` | from the model | brother-ql: built-in profile name or a profile JSON file |
 | `--media-policy` | `roll` | brother-ql: `roll` or `roll+presets` (see below) |
@@ -294,16 +325,22 @@ airprint-usb-bridge status               # query the printer once
 
 ## How a job is printed
 
-1. The document is decoded to grey: URF from Apple devices, PWG raster from other IPP
-   Everywhere clients.
+1. The document is decoded: URF from Apple devices, PWG raster from other IPP Everywhere
+   clients. A job prints in colour when the printer is advertised as colour, its
+   `print-color-mode` is `color` or `auto` (the default), and the document has a pixel that
+   is not gray; it is then decoded to RGB. Otherwise (`monochrome`, `auto-monochrome`, a gray
+   document, also one sent as sRGB with only gray pixels, a gray printer) it is decoded to
+   gray, and prints exactly as on a gray printer. So does a colour job that does not fit in
+   colour (a page or sheet over the limits below): it prints gray rather than failing.
 2. **Every page is checked before anything is sent**. A page that cannot be decoded or
    printed aborts the job with `document-format-error`, and nothing is half printed. Label
    drivers convert every page first. Sheet drivers (pcl, postscript, cups) decode every page
    once without keeping it, then read the document again and send each page as soon as it
    is converted.
 3. Sheet drivers place each page on the sheet. Pages are scaled per `print-scaling` and turned
-   to match the sheet's orientation. Unprintable margins are cleared, and the page is then
-   binarized: photo-like pages are dithered, text and line art are thresholded.
+   to match the sheet's orientation. Unprintable margins are cleared, and a gray page is then
+   binarized: photo-like pages are dithered, text and line art are thresholded. A colour page
+   goes to the driver as RGB.
 4. The printer bytes go out one device job at a time: one per label for label printers, one per
    document for sheet printers. Copies are made by repeating the job, or by the printer where the
    driver supports that.
@@ -317,8 +354,11 @@ closed), so the printer does not wait for the rest.
 
 Sheet drivers hold about two pages in memory at a time, whatever the length of the document:
 the page being decoded and the sheet it becomes at the printer's resolution (35 MB each for A4
-at 600 dpi, 9 MB at 300 dpi). A document may be up to 512 MiB and 10000 pages, and the spool
-holds up to 1 GiB of waiting documents. A single page or sheet over 128 MiB is refused.
+at 600 dpi, 9 MB at 300 dpi; three times that in colour, 104 MB for A4 at 600 dpi). A document
+may be up to 512 MiB and 10000 pages, and the spool holds up to 1 GiB of waiting documents. A
+single decoded page or placed sheet over 128 MiB is refused; in colour that still takes A4,
+Letter and Legal at 600 dpi, while larger sizes (A3 at 600 dpi) print in colour only at a lower
+resolution (the cups driver falls back to one by itself) and otherwise print gray.
 
 Label drivers convert every page of a job before the first label prints. For them a document
 may be up to 64 MiB, and a job's decoded pages are capped at 128 MiB, and so are the sheets
@@ -372,9 +412,11 @@ These are advertised as IPP Everywhere / AirPrint sheet printers:
 
 - `printer-kind document`;
 - a `media-col-database` of the fixed sizes with their margins, and only the chosen size loaded;
-- `URF` with `W8`, `RS300` or `RS300-600`, `CP<n>`, and `DM1` for duplex;
-- `sides-supported`, `print-color-mode-supported` (monochrome only in this version),
-  `output-bin` and supply attributes;
+- `URF` with `W8` (and `SRGB24` on a colour printer), `RS300` or `RS300-600`, `CP<n>`, and
+  `DM1` for duplex; `pwg-raster-document-type-supported` `sgray_8` (and `srgb_8`);
+- `sides-supported`, `print-color-mode-supported` (`monochrome`, `auto`, `auto-monochrome`,
+  plus `color` on a colour printer, where `auto` is the default, `color-supported` and TXT
+  `Color=T` are set, and `pages-per-minute-color` is added), `output-bin` and supply attributes;
 - `kind`, `PaperMax` and `pdl` in the TXT record.
 
 They pass the IPP/1.1 and IPP/2.0 suites of `ipptool`. In CUPS's `ipp-everywhere.test` they

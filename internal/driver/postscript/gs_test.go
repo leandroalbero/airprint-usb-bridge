@@ -174,3 +174,128 @@ func countDiff(a, b *imaging.Bitmap) int {
 	}
 	return n
 }
+
+// TestGhostscriptRendersColor runs colour documents through Ghostscript: each RGB page rendered
+// at 300 dpi to PPM must be exactly the sheet the driver placed, and a gray page in the same
+// document the bitmap it encoded.
+func TestGhostscriptRendersColor(t *testing.T) {
+	gs, err := exec.LookPath("gs")
+	if err != nil {
+		t.Skip("gs (Ghostscript) not on PATH")
+	}
+	for _, c := range []struct {
+		name string
+		opts map[string]string
+	}{
+		{"level2-ascii85", nil},
+		{"level2-binary", map[string]string{"encoding": "binary"}},
+		{"level3-ascii85", map[string]string{"level": "3"}},
+		{"level3-binary-depth8", map[string]string{"level": "3", "encoding": "binary", "depth": "8"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := newDriver(t, c.opts, driver.Config{Color: "on", Media: "a5"})
+			job := drivertest.Job(t, d.Capabilities())
+			pages := []raster.Page{rgbChart(job.Media, 300, false), textPage(job.Media), rgbChart(job.Media, 300, true)}
+			var want [][]byte
+			for _, p := range pages {
+				sheet, err := imaging.Place(p, job.Media, imaging.PlaceOptions{XDPI: 300, YDPI: 300})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var rgb []byte
+				switch {
+				case sheet.RGB != nil:
+					rgb = sheet.RGB
+				case d.set.Depth == 8:
+					for _, v := range sheet.Gray {
+						rgb = append(rgb, v, v, v)
+					}
+				default:
+					bm, _, _ := imaging.Binarize(sheet, "")
+					for y := 0; y < bm.H; y++ {
+						for x := 0; x < bm.W; x++ {
+							v := byte(255)
+							if bm.At(x, y) {
+								v = 0
+							}
+							rgb = append(rgb, v, v, v)
+						}
+					}
+				}
+				want = append(want, rgb)
+			}
+			units, err := d.Render(context.Background(), job, pages)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			in := filepath.Join(dir, "job.ps")
+			if err := os.WriteFile(in, units[0].Data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(gs, "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=ppmraw", "-r300",
+				"-sOutputFile="+filepath.Join(dir, "p%d.ppm"), in)
+			if out, err := cmd.CombinedOutput(); err != nil || len(bytes.TrimSpace(out)) > 0 {
+				t.Fatalf("gs: %v\n%s", err, out)
+			}
+			for i, w := range want {
+				data, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("p%d.ppm", i+1)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				gw, gh, pix, err := parsePPM(data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if gw*gh*3 != len(w) {
+					t.Fatalf("page %d: gs rendered %dx%d, sent %d bytes", i+1, gw, gh, len(w))
+				}
+				diff := 0
+				for k := range w {
+					if pix[k] != w[k] {
+						diff++
+					}
+				}
+				if diff != 0 {
+					t.Errorf("page %d: %d samples differ", i+1, diff)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf("p%d.ppm", len(want)+1))); err == nil {
+				t.Errorf("gs rendered more than %d pages", len(want))
+			}
+		})
+	}
+}
+
+// parsePPM reads a raw (P6) 8-bit PPM, including Ghostscript's comment lines.
+func parsePPM(data []byte) (w, h int, pix []byte, err error) {
+	if !bytes.HasPrefix(data, []byte("P6")) {
+		return 0, 0, nil, fmt.Errorf("not a raw PPM")
+	}
+	i := 2
+	var v [3]int
+	for k := range v {
+		for i < len(data) && (data[i] == '#' || data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n') {
+			if data[i] == '#' {
+				for i < len(data) && data[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			i++
+		}
+		start := i
+		for i < len(data) && data[i] >= '0' && data[i] <= '9' {
+			v[k] = v[k]*10 + int(data[i]-'0')
+			i++
+		}
+		if i == start || v[k] <= 0 || v[k] > 1<<16 {
+			return 0, 0, nil, fmt.Errorf("PPM header: bad value at byte %d", start)
+		}
+	}
+	i++
+	if v[2] != 255 || len(data)-i != 3*v[0]*v[1] {
+		return 0, 0, nil, fmt.Errorf("PPM: maxval %d, %d bytes of samples for %dx%d", v[2], len(data)-i, v[0], v[1])
+	}
+	return v[0], v[1], data[i:], nil
+}

@@ -113,7 +113,7 @@ func (o *Output) Abort(err error, end []byte) error {
 // streams the first unit into memory. pages[i].Gray is set to nil once page i is converted.
 func RenderStream(ctx context.Context, s Streamer, job JobInfo, pages []raster.Page) ([]Unit, error) {
 	for i, p := range pages {
-		if p.Gray == nil {
+		if p.Gray == nil && p.RGB == nil {
 			// A nil Gray tells CheckPage the page is not decoded yet; these pages are, so it
 			// is a page without pixels.
 			p.Gray = []byte{}
@@ -148,7 +148,9 @@ func (s *slicePages) Next() (raster.Page, error) {
 	}
 	p := s.pages[s.i]
 	p.Gray = bytes.Clone(p.Gray)
+	p.RGB = bytes.Clone(p.RGB)
 	s.pages[s.i].Gray = nil
+	s.pages[s.i].RGB = nil
 	s.i++
 	return p, nil
 }

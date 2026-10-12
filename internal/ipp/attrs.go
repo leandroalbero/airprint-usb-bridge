@@ -298,6 +298,10 @@ func buildPrinterAttrs(c *Config, maxKOctets int) []printerAttr {
 		add(d, mk("printer-supply-description", goipp.TagText, goipp.String("Black")))
 		// No speed is known; 10 is ippeveprinter's default.
 		add(d, mkInts("pages-per-minute", goipp.TagInteger, 10))
+		// Required of a colour printer (PWG 5100.12), and must be absent otherwise.
+		if caps.Color {
+			add(d, mkInts("pages-per-minute-color", goipp.TagInteger, 10))
+		}
 	}
 	add(d, mk("charset-configured", goipp.TagCharset, goipp.String("utf-8")))
 	add(d, mk("charset-supported", goipp.TagCharset, kw("us-ascii", "utf-8")...))

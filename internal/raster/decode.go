@@ -27,11 +27,23 @@ const (
 	pwgHeaderLen = 1796
 )
 
-// Page is one decoded page in 8-bit gray.
+// Page is one decoded page: 8-bit gray, or 8-bit sRGB when it was decoded with Limits.RGB.
 type Page struct {
 	Width, Height int
 	XDPI, YDPI    int
-	Gray          []byte // Width*Height, 0 = black, 255 = white
+	Gray          []byte // Width*Height, 0 = black, 255 = white; nil on an RGB page
+	RGB           []byte // Width*Height*3, R G B per pixel, 255 = full intensity; nil on a gray page
+}
+
+// IsRGB reports whether the page holds RGB pixels.
+func (p Page) IsRGB() bool { return p.RGB != nil }
+
+// Pix is the page's pixels, Gray or RGB, and their bytes per pixel.
+func (p Page) Pix() ([]byte, int) {
+	if p.RGB != nil {
+		return p.RGB, 3
+	}
+	return p.Gray, 1
 }
 
 type pageHeader struct {
@@ -56,6 +68,9 @@ type Limits struct {
 	// MaxPages caps the page count; <= 0 means no cap. Pages of a few pixels cost little
 	// gray, so the gray cap alone lets a document hold millions of them.
 	MaxPages int
+	// RGB decodes every page to Page.RGB instead of Page.Gray, and MaxGrayBytes then counts
+	// three bytes per pixel. Gray pages become R=G=B, CMYK is inverted naively.
+	RGB bool
 }
 
 // DecodeLimited is Decode with caps sized for the printer. A page that Prepare
@@ -120,6 +135,39 @@ func checkHeader(h pageHeader, n int) error {
 		return fmt.Errorf("%w: page %d is %dx%d, cap %dx%d", ErrTooLarge, n, h.width, h.height, MaxWidth, MaxHeight)
 	}
 	return nil
+}
+
+// toRGB converts one row of raw pixels to sRGB. Every RGB flavour is taken as sRGB; CMYK is
+// R = 255 - min(255, C+K) and so on, with no colour management.
+func toRGB(dst, raw []byte, bypp int, subtractive bool) {
+	n := len(dst) / 3
+	switch {
+	case bypp == 1:
+		for x := 0; x < n; x++ {
+			v := raw[x]
+			if subtractive {
+				v = 255 - v
+			}
+			dst[3*x], dst[3*x+1], dst[3*x+2] = v, v, v
+		}
+	case subtractive && bypp == 4:
+		for x := 0; x < n; x++ {
+			o := 4 * x
+			k := int(raw[o+3])
+			for c := 0; c < 3; c++ {
+				dst[3*x+c] = byte(255 - min(255, int(raw[o+c])+k))
+			}
+		}
+	default:
+		for x := 0; x < n; x++ {
+			o := x * bypp
+			r, g, b := raw[o], raw[o+1], raw[o+2]
+			if subtractive {
+				r, g, b = 255-r, 255-g, 255-b
+			}
+			dst[3*x], dst[3*x+1], dst[3*x+2] = r, g, b
+		}
+	}
 }
 
 // toGray averages the first three channels only, so the K of CMYK and the

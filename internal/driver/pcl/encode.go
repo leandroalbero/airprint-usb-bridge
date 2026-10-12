@@ -17,7 +17,12 @@ type jobHeader struct {
 	code          int // ESC &l#A page size
 	duplex        int // ESC &l#S: 0 simplex, 1 long edge, 2 short edge
 	duplexCapable bool
+	color         bool // 24-bit RGB raster
 }
+
+// cidRGB24 is Configure Image Data, short form: Device RGB, direct by pixel, 8 bits per primary
+// (PCL 5 Color Technical Reference, "Configure Image Data", mode 3 example).
+const cidRGB24 = "\x1b*v6W\x00\x03\x00\x08\x08\x08"
 
 // prologue starts the job: PJL header, reset and the job's page settings.
 func prologue(h jobHeader) []byte {
@@ -36,6 +41,9 @@ func prologue(h jobHeader) []byte {
 	// Page size and orientation reset the text margins; set these after them.
 	b.WriteString("\x1b&l0L\x1b&l0E")
 	fmt.Fprintf(&b, "\x1b*t%dR", h.dpi)
+	if h.color {
+		b.WriteString(cidRGB24)
+	}
 	return b.Bytes()
 }
 

@@ -201,12 +201,24 @@ func (c *Capabilities) ColorModes() []string {
 	return modes
 }
 
-// DefaultColorMode is print-color-mode-default.
+// DefaultColorMode is print-color-mode-default: auto (which prints in colour) on a colour
+// printer.
 func (c *Capabilities) DefaultColorMode() string {
 	if c.Color {
-		return "color"
+		return "auto"
 	}
 	return "monochrome"
+}
+
+// UseColor reports whether a job in print-color-mode mode prints in colour: only on a colour
+// printer, and only for color and auto ("" is the default, auto). auto-monochrome and
+// monochrome print gray.
+func (c *Capabilities) UseColor(mode string) bool {
+	switch mode {
+	case "", "auto", "color":
+		return c.Color
+	}
+	return false
 }
 
 // AcceptsResolution reports whether a job may ask for r.

@@ -50,6 +50,10 @@ type Driver struct {
 	res        []resChoice    // advertised, default first
 	userOpts   map[string]string
 	colorModel string // ColorModel choice picked for gray input; "" keeps the PPD's
+	// color is set when the printer prints colour; colorChoice is then the ColorModel choice
+	// for colour jobs ("" keeps the PPD default or the --driver-opt one).
+	color       bool
+	colorChoice string
 }
 
 type pageSize struct {
@@ -141,6 +145,9 @@ func New(cfg driver.Config) (driver.Driver, error) {
 	}
 	d.pickColorModel(cfg)
 	if def, err = d.checkFormats(cfg, def); err != nil {
+		return nil, err
+	}
+	if err := d.pickColor(cfg, def); err != nil {
 		return nil, err
 	}
 
@@ -433,6 +440,73 @@ func (d *Driver) pickColorModel(cfg driver.Config) {
 	}
 }
 
+// pickColor decides whether the printer prints colour: with --color on, or with auto unless the
+// PPD says *ColorDevice: False (CUPS's own test), when the PPD has a ColorModel choice (the PPD
+// default first, else the first in file order) whose raster header is a colour space the
+// encoder writes, or when its default header already is one and it says *ColorDevice: True. A --driver-opt ColorModel is used as it is. Gray jobs keep the
+// gray ColorModel pickColorModel chose, so they print as they always did.
+func (d *Driver) pickColor(cfg driver.Config, def int) error {
+	mode := cfg.Color
+	switch mode {
+	case "", "auto":
+		mode = "auto"
+	case "on", "off":
+	default:
+		return fmt.Errorf("color %q: want auto, on or off", cfg.Color)
+	}
+	if mode == "off" {
+		return nil
+	}
+	device, declared := d.ppd.Attr("ColorDevice", "")
+	device = strings.Trim(device, `"`)
+	colorDevice := strings.EqualFold(device, "true")
+	if mode == "auto" && declared && strings.EqualFold(device, "false") {
+		cfg.Log("cups: the PPD says *ColorDevice: False; printing gray (--color on overrides)")
+		return nil
+	}
+	usable := func(choice string) bool {
+		saved := d.colorChoice
+		d.colorChoice = choice
+		defer func() { d.colorChoice = saved }()
+		for _, r := range d.res {
+			if h, _, err := d.headerColor(d.sizes[def], r, "", true); err == nil && !h.gray() {
+				return true
+			}
+		}
+		return false
+	}
+	found := false
+	o := d.ppd.Option("ColorModel")
+	switch {
+	case d.userOpts["ColorModel"] != "" || o == nil:
+		found = usable("") && (o != nil || colorDevice)
+	default:
+		if usable(o.Default) {
+			d.colorChoice, found = o.Default, true
+			break
+		}
+		for _, c := range o.Choices {
+			if usable(c.Name) {
+				d.colorChoice, found = c.Name, true
+				break
+			}
+		}
+	}
+	if !found {
+		if mode == "on" {
+			return errors.New("--color on: the PPD has no colour ColorModel whose raster format the driver can write")
+		}
+		if colorDevice {
+			cfg.Log("cups: the PPD says *ColorDevice: True but has no colour ColorModel the driver can write; printing gray")
+		}
+		return nil
+	}
+	d.color = true
+	h, _, _ := d.headerColor(d.sizes[def], d.res[0], "", true)
+	cfg.Log("cups: colour jobs use ColorModel %s (%d-bit colour space %d, order %d)", d.colorChoice, h.CupsBitsPerColor, h.CupsColorSpace, h.CupsColorOrder)
+	return nil
+}
+
 // checkFormats drops resolutions whose raster format the encoder cannot write or whose default
 // sheet is too large, and fails when none is left. It then drops page sizes too large even at the
 // lowest resolution left, and returns the default size's new index.
@@ -476,14 +550,14 @@ func (d *Driver) checkFormats(cfg driver.Config, def int) (int, error) {
 
 // fittingResolution is r, or when a sheet of size is too large at r, the highest resolution
 // below it that fits.
-func (d *Driver) fittingResolution(size pageSize, r resChoice, sides string) resChoice {
-	if _, _, err := d.header(size, r, sides); !errors.Is(err, errSheetTooLarge) {
+func (d *Driver) fittingResolution(size pageSize, r resChoice, sides string, color bool) resChoice {
+	if _, _, err := d.headerColor(size, r, sides, color); !errors.Is(err, errSheetTooLarge) {
 		return r
 	}
 	best, found := r, false
 	for _, c := range d.res {
 		if a := c.res.X * c.res.Y; a < r.res.X*r.res.Y && (!found || a > best.res.X*best.res.Y) {
-			if _, _, err := d.header(size, c, sides); err == nil {
+			if _, _, err := d.headerColor(size, c, sides, color); err == nil {
 				best, found = c, true
 			}
 		}
@@ -538,7 +612,13 @@ func (d *Driver) capabilities(cfg driver.Config, label bool, def int) driver.Cap
 		}
 		rs += strconv.Itoa(v)
 	}
-	urf := []string{"V1.4", "W8", "CP99"}
+	urf := []string{"V1.4", "W8"}
+	pwg := []string{"sgray_8"}
+	if d.color {
+		urf = append(urf, "SRGB24")
+		pwg = append(pwg, "srgb_8")
+	}
+	urf = append(urf, "CP99")
 	if d.duplex {
 		urf = append(urf, "DM1")
 	}
@@ -555,11 +635,12 @@ func (d *Driver) capabilities(cfg driver.Config, label bool, def int) driver.Cap
 	return driver.Capabilities{
 		MakeModel:    model,
 		Kind:         kind,
+		Color:        d.color,
 		Duplex:       d.duplex,
 		Resolutions:  res,
 		Qualities:    qualities,
 		URF:          urf,
-		PWGTypes:     []string{"sgray_8"},
+		PWGTypes:     pwg,
 		MaxCopies:    99,
 		CopiesNative: false,
 		Media:        media,
@@ -570,11 +651,19 @@ func (d *Driver) capabilities(cfg driver.Config, label bool, def int) driver.Cap
 // choices are the PPD option choices for one job: the PPD defaults, then --driver-opt options,
 // then what the job decides.
 func (d *Driver) choices(size pageSize, r resChoice, sides string) map[string]string {
+	return d.choicesFor(size, r, sides, false)
+}
+
+// choicesFor is choices for a gray or a colour job.
+func (d *Driver) choicesFor(size pageSize, r resChoice, sides string, color bool) map[string]string {
 	sel := map[string]string{}
 	for k, v := range d.userOpts {
 		sel[k] = v
 	}
-	if d.colorModel != "" {
+	switch {
+	case color && d.colorChoice != "":
+		sel["ColorModel"] = d.colorChoice
+	case !color && d.colorModel != "":
 		sel["ColorModel"] = d.colorModel
 	}
 	sel["PageSize"] = size.choice
@@ -625,7 +714,13 @@ func (d *Driver) headerFor(sel map[string]string) Header {
 // header is the page header for a job's size, resolution and sides, with the geometry of the
 // imageable area (or the whole page with full-page=true).
 func (d *Driver) header(size pageSize, r resChoice, sides string) (Header, format, error) {
-	h := d.headerFor(d.choices(size, r, sides))
+	return d.headerColor(size, r, sides, false)
+}
+
+// headerColor is header for a gray or a colour job. A colour job's sheet is RGB, three bytes a
+// dot, and its raster is written a line at a time.
+func (d *Driver) headerColor(size pageSize, r resChoice, sides string, color bool) (Header, format, error) {
+	h := d.headerFor(d.choicesFor(size, r, sides, color))
 	// loadResolutions read r from the choice's HWResolution when it has one, else from its name.
 	h.HWResolution = [2]uint32{uint32(r.res.X), uint32(r.res.Y)}
 	area := size.area
@@ -656,7 +751,12 @@ func (d *Driver) header(size pageSize, r resChoice, sides string) (Header, forma
 		return Header{}, format{}, err
 	}
 	sw, sh := imaging.SheetDots(size.sheet(), int(r.res.X), int(r.res.Y))
-	if sheet, page := int64(sw)*int64(sh), int64(f.bytesPerRow)*int64(f.rows); sheet > driver.MaxSheetBytes || page > 2*driver.MaxSheetBytes {
+	if color {
+		if sheet := 3 * int64(sw) * int64(sh); sheet > driver.MaxSheetBytes {
+			return Header{}, format{}, fmt.Errorf("%w: page %s at %dx%d dpi needs %d MiB of RGB, over the %d MiB a job may use",
+				errSheetTooLarge, size.choice, r.res.X, r.res.Y, sheet>>20, driver.MaxSheetBytes>>20)
+		}
+	} else if sheet, page := int64(sw)*int64(sh), int64(f.bytesPerRow)*int64(f.rows); sheet > driver.MaxSheetBytes || page > 2*driver.MaxSheetBytes {
 		return Header{}, format{}, fmt.Errorf("%w: page %s at %dx%d dpi needs %d MiB of gray and %d MiB of raster, over the %d MiB a job may use",
 			errSheetTooLarge, size.choice, r.res.X, r.res.Y, sheet>>20, page>>20, driver.MaxSheetBytes>>20)
 	}
@@ -712,32 +812,37 @@ type jobPlan struct {
 	f     format
 	// fitted is the resolution asked for when it was too large for the size.
 	fitted *resChoice
+	color  bool
 }
 
+// colorJob reports whether job prints in colour.
+func (d *Driver) colorJob(job driver.JobInfo) bool { return d.color && job.Color }
+
 func (d *Driver) plan(job driver.JobInfo) (jobPlan, error) {
-	pl := jobPlan{size: d.sizeFor(job.Media), r: d.resolutionFor(job), sides: job.Sides}
+	pl := jobPlan{size: d.sizeFor(job.Media), r: d.resolutionFor(job), sides: job.Sides, color: d.colorJob(job)}
 	if !d.duplex {
 		pl.sides = "one-sided"
 	}
-	if fit := d.fittingResolution(pl.size, pl.r, pl.sides); fit != pl.r {
+	if fit := d.fittingResolution(pl.size, pl.r, pl.sides, pl.color); fit != pl.r {
 		asked := pl.r
 		pl.fitted, pl.r = &asked, fit
 	}
 	var err error
-	pl.h, pl.f, err = d.header(pl.size, pl.r, pl.sides)
+	pl.h, pl.f, err = d.headerColor(pl.size, pl.r, pl.sides, pl.color)
 	return pl, err
 }
 
 func (d *Driver) placeOptions(job driver.JobInfo, h Header) imaging.PlaceOptions {
 	return imaging.PlaceOptions{
 		XDPI: int(h.HWResolution[0]), YDPI: int(h.HWResolution[1]),
-		Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget,
+		Scaling: job.Scaling, Orientation: job.Orientation, Budget: job.Budget, Color: d.colorJob(job),
 	}
 }
 
 // CheckPage checks that page n is well formed and can be placed on the job's sheet.
 func (d *Driver) CheckPage(job driver.JobInfo, n int, p raster.Page) error {
-	if p.Width <= 0 || p.Height <= 0 || (p.Gray != nil && len(p.Gray) != p.Width*p.Height) || p.XDPI <= 0 || p.YDPI <= 0 {
+	if p.Width <= 0 || p.Height <= 0 || (p.Gray != nil && len(p.Gray) != p.Width*p.Height) ||
+		(p.RGB != nil && len(p.RGB) != 3*p.Width*p.Height) || p.XDPI <= 0 || p.YDPI <= 0 {
 		return driver.DocumentErrorf("page %d: malformed %dx%d page at %dx%d dpi", n, p.Width, p.Height, p.XDPI, p.YDPI)
 	}
 	pl, err := d.plan(job)
@@ -782,14 +887,18 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, 
 	}
 	out := driver.NewOutput(ctx, w)
 	var buf []byte
-	stream := &rasterStream{ctx: ctx, next: func(n int) ([]byte, error) {
+	next := func(n int) ([]byte, error) {
 		p, err := pages.Next()
 		if err != nil {
 			return nil, err
 		}
 		buf, err = d.page(job, p, n, pl, buf[:0])
 		return buf, err
-	}}
+	}
+	if pl.color {
+		next = d.colorStream(job, pages, pl)
+	}
+	stream := &rasterStream{ctx: ctx, next: next}
 	var err error
 	if d.filter == "" {
 		cw := &outWriter{w: out, max: d.maxOut, cancel: func() {}, act: &activity{}}
@@ -798,7 +907,7 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, u driver.Unit, 
 			err = fmt.Errorf("raster exceeds %d bytes (raise --driver-opt max-output)", d.maxOut)
 		}
 	} else {
-		sel := d.choices(pl.size, pl.r, pl.sides)
+		sel := d.choicesFor(pl.size, pl.r, pl.sides, pl.color)
 		keys := make([]string, 0, len(sel))
 		for k := range sel {
 			keys = append(keys, k)
@@ -837,6 +946,7 @@ func (z pageSize) sheet() driver.Media {
 
 // page converts page n (from 1) to its raster header and data, appended to dst.
 func (d *Driver) page(job driver.JobInfo, pg raster.Page, n int, pl jobPlan, dst []byte) ([]byte, error) {
+	pg = imaging.GrayFromRGB(pg)
 	h, f, size := pl.h, pl.f, pl.size
 	xres, yres := int(h.HWResolution[0]), int(h.HWResolution[1])
 	o := d.placeOptions(job, h)
@@ -882,6 +992,88 @@ func (d *Driver) page(job driver.JobInfo, pg raster.Page, n int, pl jobPlan, dst
 	}
 	dst = append(dst, h.Marshal(byteOrder)...)
 	return encodePage(dst, &h, f, p, bm), nil
+}
+
+// colorStream returns the rasterStream source of a colour job: each page's header, then its
+// lines in chunks, converted from the placed RGB sheet as the filter reads them.
+func (d *Driver) colorStream(job driver.JobInfo, pages driver.PageReader, pl jobPlan) func(int) ([]byte, error) {
+	const chunk = 256 << 10
+	var buf []byte
+	var cur *colorPage
+	var release int64
+	var reuse []byte
+	n := 0
+	return func(int) ([]byte, error) {
+		if cur != nil {
+			buf = cur.next(buf[:0], chunk)
+			if cur.done() {
+				cur = nil
+				job.Budget.Release(release)
+			}
+			if len(buf) > 0 {
+				return buf, nil
+			}
+		}
+		p, err := pages.Next()
+		if err != nil {
+			return nil, err
+		}
+		n++
+		h := pl.h
+		e, size, err := d.colorPage(job, p, n, pl, &h, &reuse)
+		if err != nil {
+			return nil, err
+		}
+		cur, release = e, size
+		return append(buf[:0], h.Marshal(byteOrder)...), nil
+	}
+}
+
+// colorPage places page n of a colour job and returns its line encoder and the Budget bytes its
+// sheet holds.
+func (d *Driver) colorPage(job driver.JobInfo, pg raster.Page, n int, pl jobPlan, h *Header, reuse *[]byte) (*colorPage, int64, error) {
+	size := pl.size
+	xres, yres := int(h.HWResolution[0]), int(h.HWResolution[1])
+	o := d.placeOptions(job, *h)
+	o.InPlace, o.Reuse = true, reuse
+	sheet, err := imaging.Place(pg, size.sheet(), o)
+	if err != nil {
+		return nil, 0, driver.DocumentError(fmt.Errorf("page %d: %w", n, err))
+	}
+	_, ch := sheet.Pix()
+	held := int64(sheet.Width) * int64(sheet.Height) * int64(ch)
+	area := size.area
+	if d.fullPage {
+		area = [4]float64{0, 0, size.width, size.length}
+	}
+	x0 := int(math.Round(area[0] * float64(xres) / 72))
+	y0 := int(math.Round((size.length - area[3]) * float64(yres) / 72))
+	if h.Duplex && n%2 == 0 {
+		fx, fy := backSideFlip(d.backSide, h.Tumble)
+		if sheet.RGB != nil {
+			flipRGB(sheet, fx, fy)
+		} else {
+			flip(sheet, fx, fy)
+		}
+	}
+	dithered := false
+	if h.CupsBitsPerColor < 8 {
+		switch d.dither {
+		case imaging.DitherOn:
+			dithered = true
+		case "", imaging.DitherAuto:
+			if sheet.RGB != nil {
+				dithered = imaging.LooksLikePhotoRGB(sheet)
+			} else {
+				dithered = imaging.LooksLikePhoto(sheet)
+			}
+		}
+	}
+	job.Log("page %d: %dx%d pixels in colour, dithered %v", n, h.CupsWidth, h.CupsHeight, dithered)
+	if job.Debug != nil {
+		job.DebugImage(fmt.Sprintf("p%d", n), imaging.PageImage(sheet))
+	}
+	return newColorPage(h, pl.f, sheet, x0, y0, dithered), held, nil
 }
 
 // backSideFlip is how a duplex back page is pre-transformed for a PPD's *cupsBackSide, so the

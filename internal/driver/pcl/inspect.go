@@ -56,6 +56,12 @@ func Inspect(data []byte) (string, error) {
 					rows++
 					rowBytes += c.value
 					i += c.value
+				case "*vW":
+					if c.value < 0 || i+c.value > len(data) {
+						return out.String(), fmt.Errorf("pcl: configure image data of %d bytes past the end at byte %d", c.value, i)
+					}
+					line("%s (configure image data: % x%s)", c.text, data[i:i+c.value], cidText(data[i:i+c.value]))
+					i += c.value
 				case "*bY":
 					skipped += c.value
 				case "*rA":
@@ -121,6 +127,14 @@ func parseEscape(b []byte) ([]command, int, error) {
 			return nil, 0, fmt.Errorf("bad terminator %q in ESC %s", t, prefix)
 		}
 	}
+}
+
+// cidText names the short-form Configure Image Data settings the driver uses.
+func cidText(b []byte) string {
+	if len(b) == 6 && b[0] == 0 && b[1] == 3 && b[3] == 8 && b[4] == 8 && b[5] == 8 {
+		return "; device RGB, direct by pixel, 24 bits"
+	}
+	return ""
 }
 
 var pageSizes = map[int]string{1: "executive", 2: "letter", 3: "legal", 25: "a5", 26: "a4"}

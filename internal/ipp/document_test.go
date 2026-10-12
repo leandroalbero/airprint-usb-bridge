@@ -284,3 +284,63 @@ func TestIPPToolDocumentPrinter(t *testing.T) {
 		}
 	}
 }
+
+// colorRule is the colour rule of CUPS's ipp-2.0.test (PWG 5100.12 section 6.2).
+const colorRule = `{
+	NAME "pages-per-minute-color"
+	OPERATION Get-Printer-Attributes
+	GROUP operation-attributes-tag
+	ATTR charset attributes-charset utf-8
+	ATTR naturalLanguage attributes-natural-language en
+	ATTR uri printer-uri $uri
+	STATUS successful-ok
+	EXPECT color-supported OF-TYPE boolean IN-GROUP printer-attributes-tag COUNT 1 WITH-VALUE true DEFINE-MATCH PRINTER_IS_COLOR
+	EXPECT pages-per-minute OF-TYPE integer IN-GROUP printer-attributes-tag COUNT 1
+	EXPECT pages-per-minute-color OF-TYPE integer IN-GROUP printer-attributes-tag COUNT 1 IF-DEFINED PRINTER_IS_COLOR
+	EXPECT !pages-per-minute-color IF-NOT-DEFINED PRINTER_IS_COLOR
+}
+`
+
+func TestPagesPerMinuteColor(t *testing.T) {
+	for _, color := range []bool{false, true} {
+		c := docConfig(t)
+		if color {
+			c.Caps.Color = true
+			c.Caps.URF = []string{"V1.4", "W8", "SRGB24", "DM1", "CP99", "IS1", "MT1", "RS300-600"}
+			c.Caps.PWGTypes = []string{"sgray_8", "srgb_8"}
+		}
+		attrs, err := PrinterAttributes(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ppm, ppmColor []string
+		for _, a := range attrs {
+			for _, v := range a.Values {
+				switch a.Name {
+				case "pages-per-minute":
+					ppm = append(ppm, v.V.String())
+				case "pages-per-minute-color":
+					ppmColor = append(ppmColor, v.V.String())
+				}
+			}
+		}
+		want := []string(nil)
+		if color {
+			want = []string{"10"}
+		}
+		if strings.Join(ppm, " ") != "10" || strings.Join(ppmColor, " ") != strings.Join(want, " ") {
+			t.Errorf("colour %v: pages-per-minute %v, pages-per-minute-color %v", color, ppm, ppmColor)
+		}
+
+		ipptool := requireIPPTool(t)
+		testFile := filepath.Join(t.TempDir(), "color.test")
+		if err := os.WriteFile(testFile, []byte(colorRule), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ts := startServer(t, c, (&recorder{}).process)
+		out, err := exec.Command(ipptool, "-tv", "-T", "30", ts.uri("ipp"), testFile).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), "[PASS]") {
+			t.Errorf("colour %v: ipptool: %v\n%s", color, err, out)
+		}
+	}
+}

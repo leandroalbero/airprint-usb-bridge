@@ -46,6 +46,7 @@ type printer struct {
 	retry    time.Duration
 	debugDir string
 	logf     logFunc
+	maxGray  int // the decoder's budget, maxGrayBytes unless a test lowers it
 }
 
 func newPrinter(o *options, logf logFunc) (*printer, error) {
@@ -54,6 +55,10 @@ func newPrinter(o *options, logf logFunc) (*printer, error) {
 		return nil, err
 	}
 	dither, err := parseDither(o.dither)
+	if err != nil {
+		return nil, err
+	}
+	colorFlag, err := parseColor(o.color)
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +87,7 @@ func newPrinter(o *options, logf logFunc) (*printer, error) {
 		Dither:       dither,
 		HighRes:      o.highRes,
 		PPD:          o.ppd,
+		Color:        colorFlag,
 		Options:      opts,
 		DeviceID:     dev.DeviceID,
 		USBVendorID:  dev.VendorID,
@@ -90,6 +96,9 @@ func newPrinter(o *options, logf logFunc) (*printer, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if colorFlag == "on" && !d.Capabilities().Color {
+		logf("warning: --color on: the %s driver prints in black only", name)
 	}
 	send, err := driver.NewSender(d, target)
 	if err != nil {
@@ -109,6 +118,7 @@ func newPrinter(o *options, logf logFunc) (*printer, error) {
 		retry:    o.retryDeadline,
 		debugDir: o.debugDir,
 		logf:     logf,
+		maxGray:  maxGrayBytes,
 	}, nil
 }
 
@@ -160,6 +170,7 @@ func (p *printer) jobInfo(info driver.JobInfo, logf logFunc, debugPrefix string)
 	if info.ColorMode == "" {
 		info.ColorMode = p.caps.DefaultColorMode()
 	}
+	info.Color = p.caps.UseColor(info.ColorMode)
 	if info.Sides == "" {
 		info.Sides = "one-sided"
 	}
@@ -196,9 +207,9 @@ func isRaster(format string) bool {
 }
 
 // limits are the decoder's caps for the job; MaxGrayBytes is per page for a streaming driver
-// and per job for the others.
+// and per job for the others. A colour job decodes to RGB.
 func (p *printer) limits(info driver.JobInfo) raster.Limits {
-	lim := raster.Limits{MaxGrayBytes: maxGrayBytes, MaxPages: maxPages}
+	lim := raster.Limits{MaxGrayBytes: p.maxGray, MaxPages: maxPages, RGB: info.Color}
 	if pl, ok := p.drv.(driver.PageLimiter); ok {
 		l := pl.PageLimits(info)
 		lim.WidthMin, lim.WidthMax = l.WidthMin, l.WidthMax
@@ -220,18 +231,22 @@ func (p *printer) render(ctx context.Context, doc *io.SectionReader, info driver
 	var units []driver.Unit
 	var err error
 	if isRaster(info.Format) {
-		pages, derr := raster.DecodeFrom(io.NewSectionReader(doc, 0, doc.Size()), p.limits(info))
-		if errors.Is(derr, raster.ErrNoPages) {
-			info.Log("document has no pages; nothing to print")
-			return nil, nil
+		if info.Color {
+			info.Color = colored(doc)
 		}
-		if derr != nil {
-			return nil, documentFormatError(derr)
+		if info.Color {
+			units, err = p.renderRaster(ctx, doc, info)
+			if errors.Is(err, raster.ErrTooLarge) || errors.Is(err, driver.ErrJobTooLarge) {
+				info.Log("printing in gray: not possible in colour: %v", err)
+				info.Color = false
+			}
 		}
-		for i, pg := range pages {
-			info.Log("page %d: %dx%d @%dx%ddpi", i+1, pg.Width, pg.Height, pg.XDPI, pg.YDPI)
+		if !info.Color {
+			units, err = p.renderRaster(ctx, doc, info)
 		}
-		units, err = p.drv.Render(ctx, info, pages)
+		if err != nil || units == nil {
+			return nil, err
+		}
 	} else {
 		dr, ok := p.drv.(driver.DocumentRenderer)
 		if !ok {
@@ -250,6 +265,37 @@ func (p *printer) render(ctx context.Context, doc *io.SectionReader, info driver
 		units = driver.RepeatUnits(units, info.Copies)
 	}
 	return units, nil
+}
+
+// renderRaster decodes the whole document and renders it.
+func (p *printer) renderRaster(ctx context.Context, doc *io.SectionReader, info driver.JobInfo) ([]driver.Unit, error) {
+	pages, err := raster.DecodeFrom(io.NewSectionReader(doc, 0, doc.Size()), p.limits(info))
+	if errors.Is(err, raster.ErrNoPages) {
+		info.Log("document has no pages; nothing to print")
+		return nil, nil
+	}
+	if err != nil {
+		return nil, documentFormatError(err)
+	}
+	for i, pg := range pages {
+		info.Log("page %d: %dx%d @%dx%ddpi", i+1, pg.Width, pg.Height, pg.XDPI, pg.YDPI)
+	}
+	units, err := p.drv.Render(ctx, info, pages)
+	if err != nil {
+		return nil, renderError(err)
+	}
+	return units, nil
+}
+
+// colored reports whether a raster document has a colour page, so a colour job of a gray
+// document prints as the gray job it always was. Errors are left to the decode that follows.
+func colored(doc *io.SectionReader) bool {
+	rd := raster.NewReader(io.NewSectionReader(doc, 0, doc.Size()), raster.Limits{})
+	for {
+		if _, err := rd.Skip(); err != nil {
+			return rd.Colored()
+		}
+	}
 }
 
 // sendFunc delivers one unit.
@@ -304,10 +350,19 @@ func (p *printer) printDocument(ctx context.Context, doc *io.SectionReader, info
 // streamRaster checks every page of the document first, without keeping any, so a bad page is
 // refused before anything is sent. Then each unit reads the document again from the start and
 // goes to the printer as its pages are rendered.
+//
+// The check pass reads the pages as gray, as a gray job always did. A colour job whose document
+// has no colour pixel prints as a gray one, and so does one that does not fit in colour (a page
+// over the decode budget as RGB, or a sheet over the job's budget): it prints as it did before
+// the bridge had colour, rather than not at all.
 func (p *printer) streamRaster(ctx context.Context, s driver.Streamer, ss driver.StreamSender, doc *io.SectionReader, info driver.JobInfo, onUnit func(int)) (int, error) {
+	color := info.Color
+	info.Color = false
 	lim := p.limits(info)
 	rd := raster.NewReader(io.NewSectionReader(doc, 0, doc.Size()), lim)
-	pages := 0
+	pages, largest := 0, 0
+	rgbTooLarge := error(nil)
+	var checked []raster.Page // the pages' sizes, checked again as RGB if the job is in colour
 	for {
 		if err := ctx.Err(); err != nil {
 			return 0, err
@@ -324,14 +379,38 @@ func (p *printer) streamRaster(ctx context.Context, s driver.Streamer, ss driver
 			return 0, documentFormatError(err)
 		}
 		pages++
+		largest = max(largest, pg.Width*pg.Height)
 		info.Log("page %d: %dx%d @%dx%ddpi", pages, pg.Width, pg.Height, pg.XDPI, pg.YDPI)
+		if color && rgbTooLarge == nil && int64(pg.Width)*int64(pg.Height)*3 > int64(lim.MaxGrayBytes) {
+			rgbTooLarge = fmt.Errorf("%w: page %d needs %d bytes of RGB, over the %d byte budget",
+				raster.ErrTooLarge, pages, int64(pg.Width)*int64(pg.Height)*3, lim.MaxGrayBytes)
+		}
 		if err := s.CheckPage(info, pages, pg); err != nil {
 			return 0, renderError(err)
 		}
+		if color {
+			checked = append(checked, pg)
+		}
 	}
-	units, err := s.Plan(info, pages)
-	if err != nil {
-		return 0, renderError(err)
+	var units []driver.Unit
+	if color && rd.Colored() {
+		ci := info
+		ci.Color = true
+		var err error
+		units, err = colorPlan(s, ci, checked, rgbTooLarge)
+		if err != nil {
+			info.Log("printing in gray: not possible in colour: %v", err)
+		} else {
+			info = ci
+			lim = p.limits(info)
+			info.Log("printing in colour")
+		}
+	}
+	if units == nil {
+		var err error
+		if units, err = s.Plan(info, pages); err != nil {
+			return 0, renderError(err)
+		}
 	}
 	if !p.caps.CopiesNative {
 		units = driver.RepeatUnits(units, info.Copies)
@@ -339,9 +418,28 @@ func (p *printer) streamRaster(ctx context.Context, s driver.Streamer, ss driver
 	return p.sendUnits(ctx, units, info.Logf, onUnit, func(ctx context.Context, u driver.Unit) error {
 		return ss.SendStream(ctx, u, func(w io.Writer) error {
 			pages := raster.NewReader(io.NewSectionReader(doc, 0, doc.Size()), lim)
+			if info.Color {
+				pages.Reserve(3 * largest)
+			} else {
+				pages.Reserve(largest)
+			}
 			return s.Stream(ctx, info, u, pages, w)
 		})
 	})
+}
+
+// colorPlan checks the pages for a colour job and plans it, or says why it cannot be printed in
+// colour.
+func colorPlan(s driver.Streamer, info driver.JobInfo, pages []raster.Page, rgbTooLarge error) ([]driver.Unit, error) {
+	if rgbTooLarge != nil {
+		return nil, rgbTooLarge
+	}
+	for i, pg := range pages {
+		if err := s.CheckPage(info, i+1, pg); err != nil {
+			return nil, err
+		}
+	}
+	return s.Plan(info, len(pages))
 }
 
 // streamDocument sends a pass-through document straight from the spool file.

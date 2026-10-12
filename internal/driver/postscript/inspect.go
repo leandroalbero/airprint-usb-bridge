@@ -27,15 +27,17 @@ type decoded struct {
 
 type decodedImage struct {
 	W, H, Depth int
+	RGB         bool   // 8-bit DeviceRGB samples
 	Scale       string // "<sx> <sy>" in points
 	Encoded     int    // bytes of filter data in the file
-	Data        []byte // samples, as pageImage.Data
+	Ink         int    // black dots of a 1-bit image
+	Data        []byte // samples, as pageImage.Data; nil unless kept
 }
 
 // Inspect describes a unit for dry runs: the settings and each page image of a rendered job (its
 // samples decoded and checked), or the size and DSC page count of a pass-through document.
 func (d *Driver) Inspect(data []byte) (string, error) {
-	doc, err := decodeDoc(data)
+	doc, err := decodeImages(data, false)
 	if errors.Is(err, errInspect) {
 		body := data
 		if bytes.HasPrefix(body, []byte(uel)) {
@@ -69,8 +71,10 @@ func (d *Driver) Inspect(data []byte) (string, error) {
 	for i, im := range doc.Images {
 		ink := ""
 		if im.Depth == 1 {
-			bm := &imaging.Bitmap{W: im.W, H: im.H, Stride: (im.W + 7) / 8, Pix: im.Data}
-			ink = fmt.Sprintf(", %d black dots", bm.Ink())
+			ink = fmt.Sprintf(", %d black dots", im.Ink)
+		}
+		if im.RGB {
+			ink = ", RGB"
 		}
 		fmt.Fprintf(&b, "page %d: image %dx%d depth %d scaled %s pt, %d bytes encoded%s\n",
 			i+1, im.W, im.H, im.Depth, im.Scale, im.Encoded, ink)
@@ -78,8 +82,13 @@ func (d *Driver) Inspect(data []byte) (string, error) {
 	return b.String(), nil
 }
 
-// decodeDoc parses the structure newDocWriter produces and decodes every image.
-func decodeDoc(data []byte) (*decoded, error) {
+// decodeDoc parses the structure newDocWriter produces and decodes every image, keeping the
+// samples.
+func decodeDoc(data []byte) (*decoded, error) { return decodeImages(data, true) }
+
+// decodeImages is decodeDoc keeping the samples or not: a dry run checks each image and keeps
+// only its summary, so a long colour job is not held decoded.
+func decodeImages(data []byte, keep bool) (*decoded, error) {
 	doc := &decoded{}
 	if rest, ok := bytes.CutPrefix(data, []byte(uel)); ok {
 		i := bytes.Index(rest, []byte("%!"))
@@ -113,14 +122,25 @@ func decodeDoc(data []byte) (*decoded, error) {
 
 	pos = end
 	call := []byte(" " + procImg + "\n")
+	callRGB := []byte(" " + procRGB + "\n")
 	for {
 		i := bytes.Index(data[pos:], call)
+		rgb := false
+		if j := bytes.Index(data[pos:], callRGB); j >= 0 && (i < 0 || j < i) {
+			i, rgb = j, true
+		}
 		if i < 0 {
 			break
 		}
 		lineStart := bytes.LastIndexByte(data[:pos+i], '\n') + 1
-		var im decodedImage
-		if _, err := fmt.Sscanf(string(data[lineStart:pos+i]), "%d %d %d", &im.W, &im.H, &im.Depth); err != nil {
+		im := decodedImage{RGB: rgb, Depth: 8}
+		var err error
+		if rgb {
+			_, err = fmt.Sscanf(string(data[lineStart:pos+i]), "%d %d", &im.W, &im.H)
+		} else {
+			_, err = fmt.Sscanf(string(data[lineStart:pos+i]), "%d %d %d", &im.W, &im.H, &im.Depth)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("postscript: image %d: %w", len(doc.Images)+1, err)
 		}
 		if prev := bytes.LastIndex(data[:lineStart], []byte(" scale\n")); prev >= 0 {
@@ -130,9 +150,21 @@ func decodeDoc(data []byte) (*decoded, error) {
 			}
 		}
 		start := pos + i + len(call)
+		if rgb {
+			start = pos + i + len(callRGB)
+		}
 		n, err := doc.decodeImage(&im, data[start:])
 		if err != nil {
 			return nil, fmt.Errorf("postscript: image %d: %w", len(doc.Images)+1, err)
+		}
+		switch {
+		case im.Depth == 1:
+			im.Ink = (&imaging.Bitmap{W: im.W, H: im.H, Stride: (im.W + 7) / 8, Pix: im.Data}).Ink()
+		case im.RGB && doc.Level < 3 && keep:
+			im.Data = interleave(im.Data, im.W)
+		}
+		if !keep {
+			im.Data = nil
 		}
 		doc.Images = append(doc.Images, im)
 		pos = start + n
@@ -157,6 +189,9 @@ func (doc *decoded) decodeImage(im *decodedImage, src []byte) (int, error) {
 	want := im.W * im.H
 	if im.Depth == 1 {
 		want = (im.W + 7) / 8 * im.H
+	}
+	if im.RGB {
+		want *= 3
 	}
 	if want > 1<<28 {
 		return 0, fmt.Errorf("image %dx%d too large", im.W, im.H)
@@ -193,6 +228,18 @@ func (doc *decoded) decodeImage(im *decodedImage, src []byte) (int, error) {
 	}
 	im.Encoded = used
 	return used, nil
+}
+
+// interleave turns rows of R, G and B samples into RGB rows.
+func interleave(planar []byte, w int) []byte {
+	out := make([]byte, len(planar))
+	for r := 0; r < len(planar); r += 3 * w {
+		pr, pg, pb := planar[r:r+w], planar[r+w:r+2*w], planar[r+2*w:r+3*w]
+		for x := range w {
+			out[r+3*x], out[r+3*x+1], out[r+3*x+2] = pr[x], pg[x], pb[x]
+		}
+	}
+	return out
 }
 
 // runLengthDecode decodes a RunLengthDecode stream up to its EOD byte (128), returning the bytes

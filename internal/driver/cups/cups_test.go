@@ -702,13 +702,15 @@ func TestPassThroughRaster(t *testing.T) {
 *ColorModel Gray8/Gray: "<</cupsColorSpace 18/cupsColorOrder 0/cupsBitsPerColor 8>>setpagedevice"
 *CloseUI: *ColorModel
 *OpenUI *InputSlot`, 1)
+	ppd = strings.Replace(ppd, "*ColorDevice: False", "*ColorDevice: True", 1)
 	path := filepath.Join(t.TempDir(), "colour.ppd")
 	os.WriteFile(path, []byte(ppd), 0o644)
 	d := newDriver(t, driver.Config{PPD: path, Media: "a5", Options: map[string]string{"filter": "-", "full-page": "true"}})
-	if d.colorModel != "Gray8" {
-		t.Fatalf("color model %q", d.colorModel)
+	if d.colorModel != "Gray8" || !d.Capabilities().Color {
+		t.Fatalf("color model %q, colour %v", d.colorModel, d.Capabilities().Color)
 	}
 	job := drivertest.Job(t, d.Capabilities())
+	job.ColorMode, job.Color = "monochrome", false
 	p := drivertest.SheetPage(job.Media, 300, 0, drivertest.Rect{X0: 200, Y0: 300, X1: 260, Y1: 330})
 	res := drivertest.Run(t, d, job, p)
 	h, err := UnmarshalHeader(res.Data[4:], binary.LittleEndian)

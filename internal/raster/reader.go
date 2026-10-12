@@ -20,15 +20,18 @@ type Reader struct {
 	keep    bool
 	maxGray int
 	total   int
+	reserve int // bytes the page buffer is first made for, see Reserve
 
 	started bool
 	urf     bool
 	count   uint32 // pages a URF header announces; 0 = unknown
 	n       int
 	err     error
+	colored bool
 
 	hdr      []byte
 	raw, row []byte
+	rgb      []byte // a row in RGB, to look for colour
 	px       [4]byte
 	gray     []byte
 }
@@ -46,6 +49,24 @@ func newReader(r io.Reader, lim Limits, keep bool) *Reader {
 
 // Pages is the number of pages read or skipped so far.
 func (d *Reader) Pages() int { return d.n }
+
+// Colored reports whether a page read or skipped so far has a pixel that is not gray: R, G and B
+// not all equal. A colour format whose pixels are all gray is not colour.
+func (d *Reader) Colored() bool { return d.colored }
+
+// channels is the bytes per decoded pixel.
+func (d *Reader) channels() int {
+	if d.lim.RGB {
+		return 3
+	}
+	return 1
+}
+
+// Reserve makes the page buffer, when Next first needs one, large enough for pages of n bytes
+// (decoded, as Gray or RGB), so pages that grow reuse it instead of each leaving a smaller
+// buffer behind for the collector. It allocates n bytes whatever the document holds, so it is
+// for a document already read through, whose largest page is known to be n bytes.
+func (d *Reader) Reserve(n int) { d.reserve = min(n, d.maxGray) }
 
 // Next decodes the next page. Its Gray is reused by the following call to Next, so a caller
 // that keeps a page must copy it; the caller may overwrite it. After the last page Next returns
@@ -158,16 +179,27 @@ func (d *Reader) page(skip bool) (Page, error) {
 	if d.keep {
 		used = d.total
 	}
-	if h.height > (d.maxGray-used)/h.width {
-		return Page{}, fmt.Errorf("%w: page %d needs %d bytes of gray, over the %d byte budget", ErrTooLarge, n, h.width*h.height, d.maxGray)
+	ch := d.channels()
+	if h.height > (d.maxGray-used)/(h.width*ch) {
+		what := "gray"
+		if ch == 3 {
+			what = "RGB"
+		}
+		return Page{}, fmt.Errorf("%w: page %d needs %d bytes of %s, over the %d byte budget", ErrTooLarge, n, h.width*h.height*ch, what, d.maxGray)
 	}
-	gray, err := d.body(h, skip)
+	pix, err := d.body(h, skip)
 	if err != nil {
 		return Page{}, fmt.Errorf("page %d: %w", n, err)
 	}
-	d.total += h.width * h.height
+	d.total += h.width * h.height * ch
 	d.n = n
-	return Page{Width: h.width, Height: h.height, XDPI: h.xdpi, YDPI: h.ydpi, Gray: gray}, nil
+	p := Page{Width: h.width, Height: h.height, XDPI: h.xdpi, YDPI: h.ydpi}
+	if ch == 3 {
+		p.RGB = pix
+	} else {
+		p.Gray = pix
+	}
+	return p, nil
 }
 
 func truncated(err error) error {
@@ -185,15 +217,21 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 	if cap(d.raw) < need {
 		d.raw = make([]byte, need)
 	}
-	if cap(d.row) < h.width {
-		d.row = make([]byte, h.width)
+	ch := d.channels()
+	rowLen := h.width * ch
+	if cap(d.row) < rowLen {
+		d.row = make([]byte, rowLen)
 	}
-	raw, row, px := d.raw[:need], d.row[:h.width], d.px[:bypp]
+	raw, row, px := d.raw[:need], d.row[:rowLen], d.px[:bypp]
+	check := h.bpp > 8 && !d.colored
+	if check && cap(d.rgb) < 3*h.width {
+		d.rgb = make([]byte, 3*h.width)
+	}
 	var fill byte = 0xff
 	if h.subtractive {
 		fill = 0x00
 	}
-	size := h.width * h.height
+	size := rowLen * h.height
 	limit := size
 	if !d.keep {
 		// Spare room lets a driver place a page on a sheet a few dots larger without a
@@ -202,9 +240,14 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 	}
 	var gray []byte
 	if !skip {
-		if !d.keep && cap(d.gray) >= size {
+		switch {
+		case !d.keep && cap(d.gray) >= size:
 			gray = d.gray[:0]
-		} else {
+		case !d.keep && d.reserve >= size:
+			d.gray = nil
+			gray = make([]byte, 0, d.reserve+d.reserve/64)
+		default:
+			d.gray = nil
 			// Grown with the data, so a header that lies about its size cannot make a
 			// short document allocate it.
 			gray = make([]byte, 0, min(size, 1<<20))
@@ -216,6 +259,8 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 			return nil, truncated(err)
 		}
 		rep := min(int(c)+1, h.height-y)
+		// Skip still needs the pixels while it looks for colour.
+		fillRaw := !skip || check
 		n := 0
 		for n < need {
 			b, err := d.r.ReadByte()
@@ -224,7 +269,7 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 			}
 			switch {
 			case b == 128:
-				if !skip {
+				if fillRaw {
 					for i := n; i < need; i++ {
 						raw[i] = fill
 					}
@@ -234,7 +279,7 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 				// Runs may overshoot the line; the excess is consumed and dropped.
 				k := (257 - int(b)) * bypp
 				m := min(k, need-n)
-				if skip {
+				if !fillRaw {
 					m = 0
 				}
 				if _, err := io.ReadFull(d.r, raw[n:n+m]); err != nil {
@@ -248,7 +293,7 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 				if _, err := io.ReadFull(d.r, px); err != nil {
 					return nil, truncated(err)
 				}
-				if skip {
+				if !fillRaw {
 					n += min((int(b)+1)*bypp, need-n)
 					continue
 				}
@@ -258,12 +303,25 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 			}
 		}
 		y += rep
+		if check && !gray3(d.rgb[:3*h.width], raw, bypp, h.subtractive) {
+			d.colored, check = true, false
+		}
 		if skip {
 			continue
 		}
-		toGray(row, raw, bypp, h.subtractive)
-		if len(gray)+rep*h.width > cap(gray) {
-			grown := make([]byte, len(gray), min(limit, max(2*cap(gray), len(gray)+rep*h.width)))
+		if ch == 3 {
+			toRGB(row, raw, bypp, h.subtractive)
+		} else {
+			toGray(row, raw, bypp, h.subtractive)
+		}
+		if len(gray)+rep*rowLen > cap(gray) {
+			want := max(2*cap(gray), len(gray)+rep*rowLen)
+			if ch == 3 {
+				// Doubling an RGB page leaves as much garbage as the page itself; once a
+				// megabyte of it is real, the rest is taken at once.
+				want = limit
+			}
+			grown := make([]byte, len(gray), min(limit, want))
 			copy(grown, gray)
 			gray = grown
 		}
@@ -275,4 +333,23 @@ func (d *Reader) body(h pageHeader, skip bool) ([]byte, error) {
 		d.gray = gray
 	}
 	return gray, nil
+}
+
+// gray3 converts a row of raw pixels to RGB in rgb and reports whether every pixel is gray.
+func gray3(rgb, raw []byte, bypp int, subtractive bool) bool {
+	if subtractive && bypp == 4 {
+		// The gray decode ignores K (toGray), so only the colour path prints a CMYK page's K.
+		for i := 3; i < len(raw); i += 4 {
+			if raw[i] != 0 {
+				return false
+			}
+		}
+	}
+	toRGB(rgb, raw, bypp, subtractive)
+	for i := 0; i < len(rgb); i += 3 {
+		if rgb[i] != rgb[i+1] || rgb[i+1] != rgb[i+2] {
+			return false
+		}
+	}
+	return true
 }

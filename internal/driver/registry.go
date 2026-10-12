@@ -16,6 +16,9 @@ type Config struct {
 	Dither  string // --dither: "auto", "on" or "off" ("" = auto)
 	HighRes bool   // --high-res: offer print-quality high where the driver can
 	PPD     string // --ppd, for the cups driver
+	// Color is --color: "auto" ("" = auto), "on" or "off". Each colour-capable driver says what
+	// auto means for it; label drivers ignore it.
+	Color string
 	// Options are driver-specific settings (--driver-opt key=value). The registry rejects keys
 	// the driver's Info does not list.
 	Options map[string]string

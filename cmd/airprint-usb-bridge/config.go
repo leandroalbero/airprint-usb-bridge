@@ -32,6 +32,7 @@ type options struct {
 	presets        string
 	trim           string
 	dither         string
+	color          string
 	highRes        bool
 	stateDir       string
 	mdns           string
@@ -66,6 +67,7 @@ func newFlagSet(o *options, out io.Writer) *flag.FlagSet {
 	fs.StringVar(&o.presets, "presets", "29,50", "brother-ql: preset label lengths in mm, comma separated")
 	fs.StringVar(&o.trim, "trim", "max", "brother-ql: blank rows trimmed per label end, max (no limit) or N")
 	fs.StringVar(&o.dither, "dither", "auto", "dithering: auto, on or off")
+	fs.StringVar(&o.color, "color", "auto", "colour printing: auto (cups: when the PPD has colour; postscript: when --ppd says *ColorDevice: True), on or off; label drivers print black only")
 	fs.BoolVar(&o.highRes, "high-res", false, "offer print-quality high where the driver can (brother-ql: 300x600 dpi); for print, print in high quality")
 	fs.StringVar(&o.stateDir, "state-dir", "", "directory for the UUID, TLS key pair and spool (default $STATE_DIRECTORY, /var/lib/"+progName+" as root, else ~/.local/state/"+progName+")")
 	fs.StringVar(&o.mdns, "mdns", "auto", "DNS-SD advertising: auto, avahi, builtin or off")
@@ -157,6 +159,14 @@ func parseDither(s string) (string, error) {
 		return s, nil
 	}
 	return "", fmt.Errorf("--dither %q: want auto, on or off", s)
+}
+
+func parseColor(s string) (string, error) {
+	switch s {
+	case "auto", "on", "off":
+		return s, nil
+	}
+	return "", fmt.Errorf("--color %q: want auto, on or off", s)
 }
 
 func resolveStateDir(flagVal string) (string, error) {

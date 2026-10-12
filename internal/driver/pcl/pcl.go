@@ -1,5 +1,6 @@
-// Package pcl is the pcl driver: mono PCL 5 lasers. Each page is placed on the sheet, binarized
-// and sent as PCL raster graphics (compression mode 2 or 3) inside a PJL job.
+// Package pcl is the pcl driver: PCL 5 lasers. Each page is placed on the sheet, binarized
+// and sent as PCL raster graphics (compression mode 2 or 3) inside a PJL job. With --color on
+// colour jobs go out as PCL 5c 24-bit RGB raster (Configure Image Data, direct by pixel).
 package pcl
 
 import (
@@ -64,13 +65,14 @@ func mediaHelp() string {
 	return strings.Join(s, ", ")
 }
 
-// Driver renders jobs for a mono PCL 5 laser.
+// Driver renders jobs for a PCL 5 laser, mono or (PCL 5c) colour.
 type Driver struct {
 	caps        driver.Capabilities
 	dpis        []int // offered resolutions; [0] is the default
 	compression int
 	pjl         bool
 	dither      string
+	color       bool
 }
 
 // New builds the driver from the bridge settings and the --driver-opt keys dpi, duplex,
@@ -102,6 +104,14 @@ func New(cfg driver.Config) (driver.Driver, error) {
 	case "", imaging.DitherAuto, imaging.DitherOn, imaging.DitherOff:
 	default:
 		return nil, fmt.Errorf("dither %q: want auto, on or off", cfg.Dither)
+	}
+	var color bool
+	switch cfg.Color {
+	case "", "auto", "off":
+	case "on":
+		color = true
+	default:
+		return nil, fmt.Errorf("color %q: want auto, on or off", cfg.Color)
 	}
 
 	def, err := pickMedia(cfg.Media)
@@ -135,7 +145,13 @@ func New(cfg driver.Config) (driver.Driver, error) {
 	if len(dpis) == 2 {
 		qualities = []int{driver.QualityDraft, driver.QualityNormal, driver.QualityHigh}
 	}
-	urf := []string{"V1.4", "W8", "CP99"}
+	urf := []string{"V1.4", "W8"}
+	pwg := []string{"sgray_8"}
+	if color {
+		urf = append(urf, "SRGB24")
+		pwg = append(pwg, "srgb_8")
+	}
+	urf = append(urf, "CP99")
 	if duplex {
 		urf = append(urf, "DM1")
 	}
@@ -145,11 +161,12 @@ func New(cfg driver.Config) (driver.Driver, error) {
 		caps: driver.Capabilities{
 			MakeModel:    makeModel(cfg),
 			Kind:         []string{"document"},
+			Color:        color,
 			Duplex:       duplex,
 			Resolutions:  res,
 			Qualities:    qualities,
 			URF:          urf,
-			PWGTypes:     []string{"sgray_8"},
+			PWGTypes:     pwg,
 			MaxCopies:    99,
 			CopiesNative: true,
 			Media:        media,
@@ -159,6 +176,7 @@ func New(cfg driver.Config) (driver.Driver, error) {
 		compression: compression,
 		pjl:         pjl,
 		dither:      cfg.Dither,
+		color:       color,
 	}, nil
 }
 
@@ -224,7 +242,12 @@ func (d *Driver) Render(ctx context.Context, job driver.JobInfo, pages []raster.
 }
 
 func (d *Driver) placeOptions(job driver.JobInfo, dpi int) imaging.PlaceOptions {
-	return imaging.PlaceOptions{XDPI: dpi, YDPI: dpi, Orientation: job.Orientation, Scaling: job.Scaling, Budget: job.Budget}
+	return imaging.PlaceOptions{XDPI: dpi, YDPI: dpi, Orientation: job.Orientation, Scaling: job.Scaling, Budget: job.Budget, Color: d.colorJob(job)}
+}
+
+// colorJob reports whether job goes out as 24-bit colour raster.
+func (d *Driver) colorJob(job driver.JobInfo) bool {
+	return d.color && job.Color
 }
 
 // CheckPage checks that page n can be placed on the job's sheet.
@@ -287,7 +310,10 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, _ driver.Unit, 
 	}
 	h := jobHeader{
 		name: pjlName(job), pjl: d.pjl, dpi: dpi, code: p.code,
-		duplex: duplex, duplexCapable: d.caps.Duplex,
+		duplex: duplex, duplexCapable: d.caps.Duplex, color: d.colorJob(job),
+	}
+	if h.color {
+		return d.streamColor(job, pages, p, dpi, out, h)
 	}
 	end := epilogue(h)
 	enc := &writer{compression: d.compression}
@@ -327,6 +353,7 @@ func (d *Driver) Stream(ctx context.Context, job driver.JobInfo, _ driver.Unit, 
 // page returns page n as a bitmap of the logical page: the sheet placed at dpi, binarized and
 // cropped to the logical page's columns.
 func (d *Driver) page(job driver.JobInfo, pg raster.Page, p paper, dpi, n int) (*imaging.Bitmap, error) {
+	pg = imaging.GrayFromRGB(pg)
 	o := d.placeOptions(job, dpi)
 	o.InPlace = true
 	sheet, err := imaging.Place(pg, job.Media, o)

@@ -27,23 +27,27 @@ type docInfo struct {
 	Width     int // sheet, 1/100 mm
 	Length    int
 	Sides     string
-	NumCopies int // > 1 sets /NumCopies
+	NumCopies int  // > 1 sets /NumCopies
+	Color     bool // the prolog also defines the RGB image procedure
 }
 
 const (
 	creator = "airprint-usb-bridge"
 	procImg = "aubimg"
+	procRGB = "aubrgb"
 	uel     = "\x1b%-12345X"
 	// a85Line keeps ASCII85 lines well under the DSC limit of 255 characters.
 	a85Line = 76
 )
 
-// pageImage is one sheet: packed rows of 1-bit samples (1 = black, rows padded to a byte) or
-// 8-bit gray (0 = black), covering the whole sheet at XDPI x YDPI.
+// pageImage is one sheet: packed rows of 1-bit samples (1 = black, rows padded to a byte),
+// 8-bit gray (0 = black) or, with RGB, 8-bit R G B samples, covering the whole sheet at
+// XDPI x YDPI.
 type pageImage struct {
 	W, H       int
 	XDPI, YDPI int
 	Depth      int
+	RGB        bool
 	Data       []byte
 }
 
@@ -55,6 +59,8 @@ type docWriter struct {
 	doc   docInfo
 	pages int
 	n     int
+	zw    *zlib.Writer // reset for each page: a new one costs about a megabyte
+	band  []byte       // planar rows of an RGB page at level 2
 }
 
 // errWriter keeps the first write error, so the document can be written without checking every
@@ -121,7 +127,33 @@ func newDocWriter(dst io.Writer, set settings, doc docInfo, pages int) *docWrite
 	if !set.Binary {
 		filters += " s flushfile"
 	}
-	buf.WriteString(filters + "\n  end\n} bind def\n%%EndProlog\n")
+	buf.WriteString(filters + "\n  end\n} bind def\n")
+	if doc.Color {
+		if set.planar() {
+			buf.WriteString("/" + procRGB + " { % width height " + procRGB + " -, rows of 8-bit R, G and B samples follow\n")
+		} else {
+			buf.WriteString("/" + procRGB + " { % width height " + procRGB + " -, 8-bit RGB samples follow\n")
+		}
+		buf.WriteString("  aub begin /h exch def /w exch def\n")
+		if !set.Binary {
+			buf.WriteString("  /s currentfile /ASCII85Decode filter def\n")
+		}
+		fmt.Fprintf(buf, "  /d %s /%s filter def\n", src, set.decodeFilter())
+		buf.WriteString("  /DeviceRGB setcolorspace\n")
+		if set.planar() {
+			buf.WriteString("  /pr w string def /pg w string def /pb w string def\n")
+		}
+		buf.WriteString("  << /ImageType 1 /Width w /Height h /BitsPerComponent 8 /Decode [0 1 0 1 0 1]\n")
+		if set.planar() {
+			// image calls the procedures in order, so each reads its component's next row.
+			buf.WriteString("     /ImageMatrix [w 0 0 h neg 0 h] /MultipleDataSources true\n")
+			buf.WriteString("     /DataSource [{ d pr readstring pop } { d pg readstring pop } { d pb readstring pop }] >> image\n")
+		} else {
+			buf.WriteString("     /ImageMatrix [w 0 0 h neg 0 h] /DataSource d >> image\n")
+		}
+		buf.WriteString(filters + "\n  end\n} bind def\n")
+	}
+	buf.WriteString("%%EndProlog\n")
 
 	buf.WriteString("%%BeginSetup\n")
 	feature(buf, fmt.Sprintf("/PageSize [%s %s]", num(pt(doc.Width)), num(pt(doc.Length))))
@@ -148,6 +180,11 @@ func feature(buf io.Writer, entries string) {
 	fmt.Fprintf(buf, "[{ << %s >> setpagedevice } stopped cleartomark\n", entries)
 }
 
+// planar reports whether an RGB image is sent as rows of R, then G, then B samples. Interleaved
+// samples of a colour other than gray never repeat, so RunLengthDecode (level 2) cannot shorten
+// them; FlateDecode (level 3) can.
+func (s settings) planar() bool { return s.Level < 3 }
+
 func (s settings) decodeFilter() string {
 	if s.Level >= 3 {
 		return "FlateDecode"
@@ -162,22 +199,36 @@ func (w *docWriter) page(img pageImage) error {
 	if img.Depth == 1 {
 		want = (img.W + 7) / 8 * img.H
 	}
-	if img.W <= 0 || img.H <= 0 || (img.Depth != 1 && img.Depth != 8) || len(img.Data) != want {
-		return fmt.Errorf("postscript: bad page image %dx%d depth %d with %d bytes", img.W, img.H, img.Depth, len(img.Data))
+	if img.RGB {
+		want *= 3
+	}
+	if img.W <= 0 || img.H <= 0 || (img.Depth != 1 && img.Depth != 8) || len(img.Data) != want ||
+		(img.RGB && (img.Depth != 8 || !w.doc.Color)) {
+		return fmt.Errorf("postscript: bad page image %dx%d depth %d rgb %v with %d bytes", img.W, img.H, img.Depth, img.RGB, len(img.Data))
 	}
 	w.n++
 	sx, sy := float64(img.W)*72/float64(img.XDPI), float64(img.H)*72/float64(img.YDPI)
 	fmt.Fprintf(w.buf, "%%%%Page: %d %d\n/pagesave save def\n", w.n, w.n)
 	fmt.Fprintf(w.buf, "0 %s translate %s %s scale\n", num(pt(w.doc.Length)-sy), num(sx), num(sy))
-	fmt.Fprintf(w.buf, "%d %d %d %s\n", img.W, img.H, img.Depth, procImg)
-	if err := w.samples(img.Data); err != nil {
+	if img.RGB {
+		fmt.Fprintf(w.buf, "%d %d %s\n", img.W, img.H, procRGB)
+	} else {
+		fmt.Fprintf(w.buf, "%d %d %d %s\n", img.W, img.H, img.Depth, procImg)
+	}
+	planarWidth := 0
+	if img.RGB && w.set.planar() {
+		planarWidth = img.W
+	}
+	if err := w.samples(img.Data, planarWidth); err != nil {
 		return err
 	}
 	w.buf.WriteString("pagesave restore\nshowpage\n")
 	return w.buf.err
 }
 
-func (w *docWriter) samples(data []byte) error {
+// samples writes data through the image's filters; with planarWidth, data is RGB rows of that
+// many pixels, sent planar.
+func (w *docWriter) samples(data []byte, planarWidth int) error {
 	var dst io.Writer = w.buf
 	var a85 io.WriteCloser
 	if !w.set.Binary {
@@ -185,7 +236,12 @@ func (w *docWriter) samples(data []byte) error {
 		dst = a85
 	}
 	if w.set.Level >= 3 {
-		zw := zlib.NewWriter(dst)
+		if w.zw == nil {
+			w.zw = zlib.NewWriter(dst)
+		} else {
+			w.zw.Reset(dst)
+		}
+		zw := w.zw
 		if _, err := zw.Write(data); err != nil {
 			return err
 		}
@@ -193,7 +249,13 @@ func (w *docWriter) samples(data []byte) error {
 			return err
 		}
 	} else {
-		if err := imaging.PackBitsTo(dst, data); err != nil {
+		var err error
+		if planarWidth > 0 {
+			err = w.packPlanar(dst, data, planarWidth)
+		} else {
+			err = imaging.PackBitsTo(dst, data)
+		}
+		if err != nil {
 			return err
 		}
 		if _, err := dst.Write([]byte{0x80}); err != nil {
@@ -208,6 +270,31 @@ func (w *docWriter) samples(data []byte) error {
 	}
 	w.buf.WriteString("~>\n")
 	return w.buf.err
+}
+
+// packPlanar run-length encodes RGB rows of width pixels as an R row, a G row and a B row each,
+// reordering a band of rows at a time.
+func (w *docWriter) packPlanar(dst io.Writer, data []byte, width int) error {
+	row := 3 * width
+	rows := max(1, (1<<20)/row)
+	if cap(w.band) < rows*row {
+		w.band = make([]byte, rows*row)
+	}
+	for off := 0; off < len(data); {
+		band := w.band[:min(rows*row, len(data)-off)]
+		for r := 0; r < len(band); r += row {
+			src := data[off+r : off+r+row]
+			pr, pg, pb := band[r:r+width], band[r+width:r+2*width], band[r+2*width:r+row]
+			for x := range width {
+				pr[x], pg[x], pb[x] = src[3*x], src[3*x+1], src[3*x+2]
+			}
+		}
+		if err := imaging.PackBitsTo(dst, band); err != nil {
+			return err
+		}
+		off += len(band)
+	}
+	return nil
 }
 
 // writeASCII85 writes src as ASCII85 lines ending in the EOD marker "~>".

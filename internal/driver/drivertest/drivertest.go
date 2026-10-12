@@ -36,6 +36,23 @@ func Page(w, h, dpi int, draw func(x, y int) byte) raster.Page {
 	return p
 }
 
+// RGBPage builds a w x h RGB page at dpi; draw returns each pixel's R, G and B. A nil draw
+// gives a white page.
+func RGBPage(w, h, dpi int, draw func(x, y int) (r, g, b byte)) raster.Page {
+	p := raster.Page{Width: w, Height: h, XDPI: dpi, YDPI: dpi, RGB: make([]byte, 3*w*h)}
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			r, g, b := byte(255), byte(255), byte(255)
+			if draw != nil {
+				r, g, b = draw(x, y)
+			}
+			o := 3 * (y*w + x)
+			p.RGB[o], p.RGB[o+1], p.RGB[o+2] = r, g, b
+		}
+	}
+	return p
+}
+
 // Rect is a black rectangle in page pixels, X1 and Y1 exclusive.
 type Rect struct{ X0, Y0, X1, Y1 int }
 
@@ -58,7 +75,7 @@ func SheetPage(m driver.Media, dpi, length int, rects ...Rect) raster.Page {
 }
 
 // Job is the JobInfo the bridge passes for a job that sent no template attributes: one copy,
-// default media, quality, colour mode, one-sided, logging to t.
+// default media, quality, colour mode (in colour on a colour printer), one-sided, logging to t.
 func Job(t testing.TB, caps driver.Capabilities) driver.JobInfo {
 	return driver.JobInfo{
 		ID: 1, Name: "test", User: "tester", Format: "image/pwg-raster",
@@ -66,6 +83,7 @@ func Job(t testing.TB, caps driver.Capabilities) driver.JobInfo {
 		Media:     caps.Default(),
 		Quality:   caps.DefaultQuality(),
 		ColorMode: caps.DefaultColorMode(),
+		Color:     caps.UseColor(caps.DefaultColorMode()),
 		Sides:     "one-sided",
 		Logf:      t.Logf,
 	}
@@ -141,8 +159,8 @@ func Attributes(t testing.TB, caps driver.Capabilities) (string, map[string]stri
 }
 
 // CheckCapabilities fails t when caps are invalid or miss what AirPrint / IPP Everywhere clients
-// need: URF V1.4 and CP<n>, an RS token naming every resolution, W8 (and SRGB24 with srgb_8 for
-// colour), DM1 for duplex, sgray_8, and at least one ready medium.
+// need: URF V1.4 and CP<n>, an RS token naming every resolution, W8 (and SRGB24 with srgb_8
+// exactly when Color is set), DM1 for duplex, sgray_8, and at least one ready medium.
 func CheckCapabilities(t testing.TB, caps driver.Capabilities) {
 	t.Helper()
 	if err := caps.Validate(); err != nil {
@@ -177,6 +195,9 @@ func CheckCapabilities(t testing.TB, caps driver.Capabilities) {
 	}
 	if caps.Color && (!urf["SRGB24"] || !slices.Contains(caps.PWGTypes, "srgb_8")) {
 		t.Errorf("colour printer needs URF SRGB24 and PWG srgb_8: %v %v", caps.URF, caps.PWGTypes)
+	}
+	if !caps.Color && (urf["SRGB24"] || slices.Contains(caps.PWGTypes, "srgb_8")) {
+		t.Errorf("gray printer advertises URF SRGB24 or PWG srgb_8: %v %v", caps.URF, caps.PWGTypes)
 	}
 	if caps.Duplex && !hasPrefix(caps.URF, "DM") {
 		t.Errorf("duplex printer needs a URF DM token: %v", caps.URF)

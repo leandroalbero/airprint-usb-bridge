@@ -19,6 +19,7 @@ type pclPage struct {
 	compression int
 	width       int      // ESC *r#S, dots
 	rows        [][]byte // decoded rows, index = raster row from the top of the logical page
+	color       bool     // 24-bit RGB rows (Configure Image Data, device RGB, direct by pixel)
 }
 
 type pclJob struct {
@@ -48,8 +49,14 @@ func parsePCL(data []byte) (pclJob, error) {
 		rows                                  [][]byte
 		y                                     int
 		drawn                                 bool
+		color                                 bool
 	}{duplex: -1, orient: -1}
-	stride := func() int { return (st.width + 7) / 8 }
+	stride := func() int {
+		if st.color {
+			return 3 * st.width
+		}
+		return (st.width + 7) / 8
+	}
 	for i := 0; i < len(data); {
 		switch {
 		case bytes.HasPrefix(data[i:], []byte("\x1b%-12345X")):
@@ -69,7 +76,7 @@ func parsePCL(data []byte) (pclJob, error) {
 				return job, fmt.Errorf("page without size, resolution or portrait orientation at %d", i)
 			}
 			p := pclPage{sizeCode: st.size, dpi: st.dpi, duplex: st.duplex, frontSide: st.front,
-				compression: st.compression, width: st.width}
+				compression: st.compression, width: st.width, color: st.color}
 			if st.drawn {
 				p.rows = st.rows
 			}
@@ -82,6 +89,7 @@ func parsePCL(data []byte) (pclJob, error) {
 			}
 			job.resets++
 			st.size, st.dpi, st.duplex, st.compression, st.width, st.orient = 0, 0, -1, 0, 0, -1
+			st.color = false
 			i += 2
 		case data[i] == 0x1b && i+2 < len(data):
 			group := string(data[i+1 : i+3])
@@ -120,6 +128,15 @@ func parsePCL(data []byte) (pclJob, error) {
 					st.front = true
 				case "*tR":
 					st.dpi = v
+				case "*vW":
+					// PCL 5 Color Technical Reference, Configure Image Data short form: colour
+					// space 0 (device RGB), pixel encoding 3 (direct by pixel), bits per index
+					// (ignored), 8 bits for each primary.
+					if v != 6 || i+6 > len(data) || !bytes.Equal(data[i:i+6], []byte{0, 3, 0, 8, 8, 8}) || st.inRaster {
+						return job, fmt.Errorf("configure image data %d bytes % x", v, data[i:min(i+v, len(data))])
+					}
+					st.color = true
+					i += 6
 				case "*pX":
 					if v != 0 {
 						return job, fmt.Errorf("cursor x %d", v)
@@ -133,8 +150,8 @@ func parsePCL(data []byte) (pclJob, error) {
 				case "*rS":
 					st.width = v
 				case "*bM":
-					if v != 2 && v != 3 {
-						return job, fmt.Errorf("compression %d", v)
+					if v != 2 && v != 3 || st.color && v != 3 {
+						return job, fmt.Errorf("compression %d (colour %v)", v, st.color)
 					}
 					st.compression = v
 				case "*rA":
@@ -151,6 +168,9 @@ func parsePCL(data []byte) (pclJob, error) {
 				case "*bY":
 					if !st.inRaster {
 						return job, fmt.Errorf("Y offset outside raster graphics")
+					}
+					if st.color {
+						return job, fmt.Errorf("Y offset in 24-bit colour: it fills with black")
 					}
 					if st.compression == 3 {
 						for _, b := range st.seed {
@@ -172,6 +192,9 @@ func parsePCL(data []byte) (pclJob, error) {
 						row, err = unpackMode2(payload, stride())
 					} else {
 						row, err = applyMode3(payload, st.seed)
+					}
+					if st.color && len(row) != stride() {
+						return job, fmt.Errorf("colour row of %d bytes, raster width %d", len(row), stride())
 					}
 					if err != nil {
 						return job, fmt.Errorf("row %d: %w", st.y, err)

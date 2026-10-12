@@ -27,9 +27,18 @@ type PlaceOptions struct {
 	// JobInfo.Budget). Place then fails with driver.ErrJobTooLarge instead of running out of
 	// memory on a tiny low-resolution page that scales up to a huge sheet.
 	Budget *driver.Budget
-	// InPlace lets Place draw the sheet over p.Gray and return it, when the page goes on the
-	// sheet 1:1 and p.Gray's capacity holds the sheet; the caller must not use p afterwards.
+	// InPlace lets Place draw the sheet over p.Gray (p.RGB) and return it, when the page goes
+	// on the sheet 1:1 and the buffer's capacity holds the sheet; the caller must not use p
+	// afterwards.
 	InPlace bool
+	// Color makes CheckPlace count three bytes per dot, for a page that will be decoded as RGB
+	// (the check pass sees pages without pixels). Place goes by the page it is given.
+	Color bool
+	// Reuse, when set, is where Place draws an RGB sheet it cannot place in place: the buffer
+	// is used when large enough and kept there otherwise. A driver streaming pages keeps one
+	// per job, so turned or scaled colour pages do not each leave a 100 MB sheet to the
+	// collector. The previous sheet drawn there is overwritten.
+	Reuse *[]byte
 }
 
 // Place scales and positions p on a sheet of media's size at the output resolution and returns
@@ -39,6 +48,9 @@ type PlaceOptions struct {
 // When the scale is 1 and the resolutions match, pixels are copied exactly; otherwise each output
 // pixel is the mean of the source pixels it covers (or the nearest one when enlarging).
 func Place(p raster.Page, media driver.Media, o PlaceOptions) (raster.Page, error) {
+	if p.RGB != nil {
+		return placeRGB(p, media, o)
+	}
 	if len(p.Gray) != p.Width*p.Height {
 		return raster.Page{}, malformed(p)
 	}
@@ -123,17 +135,28 @@ func shiftInPlace(p raster.Page, pl placement) (raster.Page, bool) {
 // placing it; p.Gray may be nil. The sheet is checked against the whole Budget, not charged:
 // a driver that streams pages releases each sheet before placing the next.
 func CheckPlace(p raster.Page, media driver.Media, o PlaceOptions) error {
-	if p.Gray != nil && len(p.Gray) != p.Width*p.Height {
+	if (p.Gray != nil && len(p.Gray) != p.Width*p.Height) || (p.RGB != nil && len(p.RGB) != 3*p.Width*p.Height) {
 		return malformed(p)
 	}
 	pl, err := plan(p, media, o)
 	if err != nil {
 		return err
 	}
-	return o.Budget.Check(int64(pl.outW) * int64(pl.outH))
+	return o.Budget.Check(int64(pl.outW) * int64(pl.outH) * int64(channels(p, o)))
+}
+
+// channels is the bytes per dot of the sheet p becomes.
+func channels(p raster.Page, o PlaceOptions) int {
+	if p.RGB != nil || o.Color {
+		return 3
+	}
+	return 1
 }
 
 func malformed(p raster.Page) error {
+	if p.RGB != nil {
+		return fmt.Errorf("imaging: malformed page %dx%d @%dx%d with %d RGB bytes", p.Width, p.Height, p.XDPI, p.YDPI, len(p.RGB))
+	}
 	return fmt.Errorf("imaging: malformed page %dx%d @%dx%d with %d gray bytes", p.Width, p.Height, p.XDPI, p.YDPI, len(p.Gray))
 }
 
@@ -231,7 +254,7 @@ func plan(p raster.Page, media driver.Media, o PlaceOptions) (placement, error) 
 	if pl.pw > 0 && pl.ph > 0 && (pl.pw != w || pl.ph != h) {
 		// resample's buffers are transient, so they are checked but not charged; a page
 		// placed at "none" or "fill" may be far larger than the sheet it is cropped to.
-		if err := o.Budget.Check(int64(pl.pw) * int64(max(pl.ph, h))); err != nil {
+		if err := o.Budget.Check(int64(pl.pw) * int64(max(pl.ph, h)) * int64(channels(p, o))); err != nil {
 			return pl, err
 		}
 	}

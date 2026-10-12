@@ -5,7 +5,7 @@ import "github.com/leandroalbero/airprint-usb-bridge/internal/driver"
 func init() {
 	driver.Register(driver.Info{
 		Name:        "postscript",
-		Description: "PostScript level 2/3 printers (raster images)",
+		Description: "PostScript level 2/3 printers (raster images; colour with --color)",
 		Media:       "a4 (default), letter, legal, a5, executive, or their PWG names (iso_a4_210x297mm, na_letter_8.5x11in, ...)",
 		Options: []driver.Option{
 			{Key: "level", Default: "2", Help: "PostScript LanguageLevel: 2 (RunLengthDecode) or 3 (FlateDecode)"},
